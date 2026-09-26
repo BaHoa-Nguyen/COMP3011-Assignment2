@@ -4,7 +4,7 @@
  *
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Ba Hoa Nguyen - a1938499
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -84,7 +84,21 @@ public class CommandLineController {
   private void parse() {
     List<String> videoFiles = new ArrayList<>();
 
+    // for stacking up the frames
+    List<String> stackedFrames = new ArrayList<>();
+
     for (String arg : args) {
+      // start with -, followed by at least 2 lowercase letter and nothing else
+      if (arg.matches("^-[a-z]{2,}$")) {
+        for (int argIndex = 1; argIndex < arg.length(); argIndex++) {
+          stackedFrames.add("-" + arg.charAt(argIndex));
+        }
+      } else {
+        stackedFrames.add(arg);
+      }
+    }
+
+    for (String arg : stackedFrames) {
       if ("-h".equals(arg) || "--help".equals(arg)) {
         helpRequested = true;
       } else if ("-a".equals(arg) || "--audio".equals(arg)) {
