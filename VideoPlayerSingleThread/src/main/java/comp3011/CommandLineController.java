@@ -14,6 +14,11 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 
+import java.util.Map;
+import java.util.function.Supplier;
+
+import org.bytedeco.opencv.presets.opencv_core.Str;
+
 /**
  * Created in the VideoPlayerApp's main function to receive and parse the video
  * player's command-line arguments.
@@ -37,6 +42,42 @@ public class CommandLineController {
 
   // storing the effects
   private List<FrameProcessor> frameProcessors = new ArrayList<>();
+
+  // use a Map + Supplier for faster lookup of the frame instead of a chaining
+  // if-else
+  private final Map<String, Supplier<FrameProcessor>> frameProcessorMap = Map.ofEntries(
+      Map.entry("-n", FrameNumberer::new),
+      Map.entry("--number-frames", FrameNumberer::new),
+
+      Map.entry("-s", FrameScratcher::new),
+      Map.entry("--scratch-frames", FrameScratcher::new),
+
+      Map.entry("-f", FrameFlickerer::new),
+      Map.entry("--flicker-frames", FrameFlickerer::new),
+
+      Map.entry("-w", FrameBlackAndWhiter::new),
+      Map.entry("--black-and-white", FrameBlackAndWhiter::new),
+
+      Map.entry("-y", FrameYellower::new),
+      Map.entry("--yellow-frames", FrameYellower::new),
+
+      Map.entry("-v", FrameVignetter::new),
+      Map.entry("--vignette-frame", FrameVignetter::new),
+
+      Map.entry("-d", FrameDuster::new),
+      Map.entry("--dust-frame", FrameDuster::new),
+
+      Map.entry("-j", FrameJitterer::new),
+      Map.entry("--jitter-frames", FrameJitterer::new),
+
+      Map.entry("-m", FrameMottler::new),
+      Map.entry("--mottle-frames", FrameMottler::new),
+
+      Map.entry("-b", FrameBleeder::new),
+      Map.entry("--bleed-frames", FrameBleeder::new),
+
+      Map.entry("-p", FramePepperer::new),
+      Map.entry("--pepper-frames", FramePepperer::new));
 
   public CommandLineController(String[] args) {
     this.args = args.clone();
@@ -84,61 +125,33 @@ public class CommandLineController {
   private void parse() {
     List<String> videoFiles = new ArrayList<>();
 
-    // for stacking up the frames
-    List<String> stackedFrames = new ArrayList<>();
-
-    for (String arg : args) {
-      // start with -, followed by at least 2 lowercase letter and nothing else
-      if (arg.matches("^-[a-z]{2,}$")) {
-        for (int argIndex = 1; argIndex < arg.length(); argIndex++) {
-          stackedFrames.add("-" + arg.charAt(argIndex));
-        }
-      } else {
-        stackedFrames.add(arg);
-      }
-    }
+    List<String> stackedFrames = stackFrameProcessor();
 
     for (String arg : stackedFrames) {
-      if ("-h".equals(arg) || "--help".equals(arg)) {
-        helpRequested = true;
-      } else if ("-a".equals(arg) || "--audio".equals(arg)) {
-        audioRequested = true;
-      } else if ("-x".equals(arg) || "--maximise".equals(arg)) {
-        maximiseRequested = true;
-      } else if ("-1".equals(arg) || "--monitor-1".equals(arg)) {
-        setDisplayId(1);
-      } else if ("-2".equals(arg) || "--monitor-2".equals(arg)) {
-        setDisplayId(2);
-        // adding effects
-      } else if ("-n".equals(arg) || "--number-frames".equals(arg)) {
-        frameProcessors.add(new FrameNumberer());
-      } else if ("-s".equals(arg) || "--scratch-frames".equals(arg)) {
-        frameProcessors.add(new FrameScratcher());
-      } else if ("-f".equals(arg) || "--flicker-frames".equals(arg)) {
-        frameProcessors.add(new FrameFlickerer());
-      } else if ("-w".equals(arg) || "--black-and-white".equals(arg)) {
-        frameProcessors.add(new FrameBlackAndWhiter());
-      } else if ("-y".equals(arg) || "--yellow-frames".equals(arg)) {
-        frameProcessors.add(new FrameYellower());
-      } else if ("-v".equals(arg) || "--vignette-frame".equals(arg)) {
-        frameProcessors.add(new FrameVignetter());
-      } else if ("-d".equals(arg) || "--dust-frame".equals(arg)) {
-        frameProcessors.add(new FrameDuster());
-      } else if ("-j".equals(arg) || "--jitter-frames".equals(arg)) {
-        frameProcessors.add(new FrameJitterer());
-      } else if ("-m".equals(arg) || "--mottle-frames".equals(arg)) {
-        frameProcessors.add(new FrameMottler());
-      } else if ("-b".equals(arg) || "--bleed-frames".equals(arg)) {
-        frameProcessors.add(new FrameBleeder());
-      } else if ("-p".equals(arg) || "--pepper-frames".equals(arg)) {
-        frameProcessors.add(new FramePepperer());
-      } else if (arg.startsWith("-")) {
-        errorMessage = "Unknown option: " + arg;
-      } else {
-        videoFiles.add(arg);
-      }
+      processArgument(arg, videoFiles);
     }
 
+    validateVideoFile(videoFiles);
+
+  }
+
+  // handling frame stacking up
+  private List<String> stackFrameProcessor() {
+    List<String> stackedProcessors = new ArrayList<>();
+
+    for (String arg : args) {
+      if (arg.matches("^-[a-z]{2,}$")) {
+        for (int argIndex = 1; argIndex < arg.length(); argIndex++) {
+          stackedProcessors.add("-" + arg.charAt(argIndex));
+        }
+      } else {
+        stackedProcessors.add(arg);
+      }
+    }
+    return stackedProcessors;
+  }
+
+  private void validateVideoFile(List<String> videoFiles) {
     if (videoFiles.size() > 1) {
       errorMessage = "Usage: VideoPlayer [options] [video-file]";
     } else if (videoFiles.size() == 1) {
@@ -152,6 +165,39 @@ public class CommandLineController {
         errorMessage = "No video file specified.";
       }
     }
+
+  }
+
+  // process the arguments
+  private void processArgument(String arg, List<String> videoFiles) {
+    if ("-h".equals(arg) || "--help".equals(arg)) {
+      helpRequested = true;
+    } else if ("-a".equals(arg) || "--audio".equals(arg)) {
+      audioRequested = true;
+    } else if ("-x".equals(arg) || "--maximise".equals(arg)) {
+      maximiseRequested = true;
+    } else if ("-1".equals(arg) || "--monitor-1".equals(arg)) {
+      setDisplayId(1);
+    } else if ("-2".equals(arg) || "--monitor-2".equals(arg)) {
+      setDisplayId(2);
+      // adding effects
+    } else {
+
+      // Reference:
+      // https://medium.com/but-it-works-on-my-machine/supplier-t-what-is-it-and-how-to-use-it-in-java-846e8517374a?sk=5d48b62fad246a079716b5c791a55284
+      Supplier<FrameProcessor> frameFactory = frameProcessorMap.get(arg);
+
+      // Map will return null when the key does not exist
+      if (frameFactory != null) {
+        frameProcessors.add(frameFactory.get());
+      } else if (arg.startsWith("-")) {
+        errorMessage = "Unknown option: " + arg;
+      } else {
+        videoFiles.add(arg);
+      }
+
+    }
+
   }
 
   private void setDisplayId(int displayId) {
@@ -172,7 +218,7 @@ public class CommandLineController {
     System.out.println("  -1, --monitor-1    Open the player on display 1");
     System.out.println("  -2, --monitor-2    Open the player on display 2");
     System.out.println();
-    System.out.println("Frame Processor");
+    System.out.println("Frame processors:");
     System.out.println("  -n, --number-frames    Render the frame number onto each frame");
     System.out.println("  -s, --scratch-frames   Render vertical film scratches");
     System.out.println("  -f, --flicker-frames   Randomly dim frames");
