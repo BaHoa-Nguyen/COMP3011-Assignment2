@@ -79,6 +79,23 @@ public class CommandLineController {
       Map.entry("-p", FramePepperer::new),
       Map.entry("--pepper-frames", FramePepperer::new));
 
+  // use Map to avoid long if-else chaining
+  private final Map<String, Runnable> optionMap = Map.of(
+      "-h", () -> helpRequested = true,
+      "--help", () -> helpRequested = true,
+
+      "-a", () -> audioRequested = true,
+      "--audio", () -> audioRequested = true,
+
+      "-x", () -> maximiseRequested = true,
+      "--maximise", () -> maximiseRequested = true,
+
+      "-1", () -> setDisplayId(1),
+      "--monitor-1", () -> setDisplayId(1),
+
+      "-2", () -> setDisplayId(2),
+      "--monitor-2", () -> setDisplayId(2));
+
   public CommandLineController(String[] args) {
     this.args = args.clone();
     parse();
@@ -170,32 +187,25 @@ public class CommandLineController {
 
   // process the arguments
   private void processArgument(String arg, List<String> videoFiles) {
-    if ("-h".equals(arg) || "--help".equals(arg)) {
-      helpRequested = true;
-    } else if ("-a".equals(arg) || "--audio".equals(arg)) {
-      audioRequested = true;
-    } else if ("-x".equals(arg) || "--maximise".equals(arg)) {
-      maximiseRequested = true;
-    } else if ("-1".equals(arg) || "--monitor-1".equals(arg)) {
-      setDisplayId(1);
-    } else if ("-2".equals(arg) || "--monitor-2".equals(arg)) {
-      setDisplayId(2);
-      // adding effects
+    Runnable option = optionMap.get(arg);
+
+    // Reference:
+    // https://medium.com/but-it-works-on-my-machine/supplier-t-what-is-it-and-how-to-use-it-in-java-846e8517374a?sk=5d48b62fad246a079716b5c791a55284
+    Supplier<FrameProcessor> frameFactory = frameProcessorMap.get(arg);// use Map to avoid long if-else chaining
+
+    // Map will return null when the key does not exist
+    if (option != null) {
+      option.run();
+      return; // return immediately as option cannot stack as required in the description
+    }
+
+    // Map will return null when the key does not exist
+    if (frameFactory != null) {
+      frameProcessors.add(frameFactory.get());
+    } else if (arg.startsWith("-")) {
+      errorMessage = "Unknown option: " + arg;
     } else {
-
-      // Reference:
-      // https://medium.com/but-it-works-on-my-machine/supplier-t-what-is-it-and-how-to-use-it-in-java-846e8517374a?sk=5d48b62fad246a079716b5c791a55284
-      Supplier<FrameProcessor> frameFactory = frameProcessorMap.get(arg);
-
-      // Map will return null when the key does not exist
-      if (frameFactory != null) {
-        frameProcessors.add(frameFactory.get());
-      } else if (arg.startsWith("-")) {
-        errorMessage = "Unknown option: " + arg;
-      } else {
-        videoFiles.add(arg);
-      }
-
+      videoFiles.add(arg);
     }
 
   }
