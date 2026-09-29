@@ -8,7 +8,8 @@
  *
  * Copyright 2026 Simon Ratcliffe
  */
-package comp3011;
+package comp3011.effects;
+import comp3011.media.InfoFrame;
 
 import java.nio.ByteBuffer;
 

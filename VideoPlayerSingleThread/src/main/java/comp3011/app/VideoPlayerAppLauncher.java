@@ -8,7 +8,7 @@
  *
  * Copyright 2026 Simon Ratcliffe
  */
-package comp3011;
+package comp3011.app;
 
 /**
  * Plain Java entry point for the packaged application. Seems overly complicated hopping through a main function that

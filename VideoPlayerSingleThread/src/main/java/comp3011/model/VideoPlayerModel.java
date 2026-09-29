@@ -8,7 +8,10 @@
  *
  * Copyright 2026 Simon Ratcliffe
  */
-package comp3011;
+package comp3011.model;
+import comp3011.effects.FrameProcessor;
+import comp3011.media.InfoFrame;
+import comp3011.media.InfoVideo;
 
 import java.io.File;
 import java.util.ArrayDeque;

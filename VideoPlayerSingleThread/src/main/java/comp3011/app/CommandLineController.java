@@ -8,7 +8,20 @@
  *
  * Copyright 2026 Simon Ratcliffe
  */
-package comp3011;
+package comp3011.app;
+
+import comp3011.effects.FrameProcessor;
+import comp3011.effects.FrameNumberer;
+import comp3011.effects.FrameScratcher;
+import comp3011.effects.FrameFlickerer;
+import comp3011.effects.FrameBlackAndWhiter;
+import comp3011.effects.FrameYellower;
+import comp3011.effects.FrameVignetter;
+import comp3011.effects.FrameDuster;
+import comp3011.effects.FrameJitterer;
+import comp3011.effects.FrameMottler;
+import comp3011.effects.FrameBleeder;
+import comp3011.effects.FramePepperer;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -16,8 +29,6 @@ import java.util.List;
 
 import java.util.Map;
 import java.util.function.Supplier;
-
-import org.bytedeco.opencv.presets.opencv_core.Str;
 
 /**
  * Created in the VideoPlayerApp's main function to receive and parse the video

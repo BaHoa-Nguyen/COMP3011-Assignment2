@@ -8,7 +8,7 @@
  *
  * Copyright 2026 Simon Ratcliffe
  */
-package comp3011;
+package comp3011.view;
 
 import javafx.geometry.Insets;
 import javafx.geometry.Point2D;
