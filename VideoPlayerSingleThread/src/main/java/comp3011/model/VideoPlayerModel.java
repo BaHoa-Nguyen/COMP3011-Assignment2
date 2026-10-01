@@ -9,14 +9,22 @@
  * Copyright 2026 Simon Ratcliffe
  */
 package comp3011.model;
+
 import comp3011.effects.FrameProcessor;
 import comp3011.media.InfoFrame;
 import comp3011.media.InfoVideo;
 
 import java.io.File;
-import java.util.ArrayDeque;
+
 import java.util.List;
 import java.util.Queue;
+
+// split the decode + effect into a separate worker thread
+// from the GUI (JavaFX) thread
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
@@ -26,7 +34,7 @@ import org.bytedeco.javacv.FrameGrabber;
 import org.bytedeco.javacv.JavaFXFrameConverter;
 
 import javafx.animation.AnimationTimer;
-import javafx.application.Platform;
+
 import javafx.scene.image.Image;
 
 /**
@@ -42,11 +50,39 @@ import javafx.scene.image.Image;
  */
 public class VideoPlayerModel {
   private static final long NO_SEEK_REQUEST = -1; // Sentinel value used when no seek position is active.
-  private static final long FIVE_SECONDS_US = 5_000_000L;
+  private static final long FIVE_SECONDS_US = 5_000_000L; // calculated in MicroSeconds
   private static final long AUDIO_LEAD_NS = 30_000_000L;
 
+  // decode + effect thread
+  private final ExecutorService decodeEffectExecutor = Executors.newSingleThreadExecutor(runnable -> {
+    Thread decodeEffectThread = new Thread(runnable, "decode-worker");
+    decodeEffectThread.setDaemon(true); // allow JVM exiting normally
+    return decodeEffectThread;
+  });
+
+  // Protects access to the prepared frame shared between threads.
+  private final Object preparedFrameLock = new Object();
+
+  // Version of the current playback session.
+  // Incremented when seeking or closing so old frames can be discarded.
+  private volatile long playbackVersion = 0;
+
+  // True while a frame-preparation job is queued or being processed.
+  private volatile boolean framePreparationInProgress = false;
+
+  // True when the decoder has reached the end of the video.
+  private volatile boolean videoEnded = false;
+
+  // Stores an error produced during background playback processing.
+  private volatile Exception backgroundPlaybackError = null;
+
   private final List<FrameProcessor> frameProcessors; // store frames
-  private final Queue<PendingAudio> pendingAudio = new ArrayDeque<>();
+  private final Queue<PendingAudio> pendingAudio = new ConcurrentLinkedQueue<>(); // ConcurrentLinkedQueue because two
+                                                                                  // threads use it: the worker adds
+                                                                                  // sound chunks, the GUI takes them
+                                                                                  // out. ArrayDeque is not safe for
+                                                                                  // that.
+
   private final BiConsumer<Integer, Integer> videoSizeChangedHandler;
   private final Consumer<Image> frameReadyHandler;
   private final Consumer<String> statusChangedHandler;
@@ -68,29 +104,35 @@ public class VideoPlayerModel {
     }
   };
 
-  private File videoFile; // Path to the media that comes from the command line
-  private FFmpegFrameGrabber grabber; // This is the 3rd party video media decoder. It deals in JavaCV Frame objects.
-  private JavaFXFrameConverter converter; // Takes Frame objects to JavaFX Image objects, which can be put on screen.
-  private AudioPlayer audioPlayer; // This is ours. It has some real time buffering smarts.
-  private PreparedFrame preparedFrame; // Ours, but is just an Image with some meta-data added.
-  private boolean prepareNextFrameQueued; // True only when the event loop needs to call our prepareNextFrame method.
-  private boolean playbackOpen; // True when playback is happening.
-  private boolean pauseRequested;
-  private boolean audioOutputEnabled;
-  private boolean audioAvailable;
-  private boolean frameProcessorsInitialised;
-  private long currentTimestampUs;
-  private long videoDurationUs = NO_SEEK_REQUEST;
-  private int videoFrameDurationUs;
-  private double frameRate;
-  private int intFrameRate;
-  private int totalVideoFrames;
-  private long firstTimestampUs = NO_SEEK_REQUEST;
-  private long logicalPlaybackBaseUs;
-  private long playbackStartNs;
-  private long pauseStartedNs;
-  private long relativeSeekBaseUs = NO_SEEK_REQUEST;
+  // since we split into 2 threads, the threads need to be kept updated with the
+  // lastest value of most of these variables --> use the volatile keyword for
+  // this purpose
 
+  private volatile File videoFile; // Path to the media that comes from the command line
+  private FFmpegFrameGrabber grabber; // This is the 3rd party video media decoder. It deals in JavaCV Frame
+                                      // objects.
+  private JavaFXFrameConverter converter; // Takes Frame objects to JavaFX Image objects, which can be put on
+                                          // screen.
+  private volatile AudioPlayer audioPlayer; // This is ours. It has some real time buffering smarts.
+  private volatile PreparedFrame preparedFrame; // Ours, but is just an Image with some meta-data added.
+  private volatile boolean playbackOpen; // True when playback is happening.
+  private volatile boolean pauseRequested; // request pause
+  private volatile boolean audioOutputEnabled;
+  private volatile boolean audioAvailable;
+  private volatile boolean frameProcessorsInitialised;
+  private volatile long currentTimestampUs; // where we are in the video (e.g. 4:00)
+  private volatile long videoDurationUs = NO_SEEK_REQUEST;
+  private volatile int videoFrameDurationUs;
+  private volatile double frameRate; // frame rate in double
+  private volatile int intFrameRate; // frame rate in Integer
+  private volatile int totalVideoFrames;
+  private volatile long firstTimestampUs = NO_SEEK_REQUEST;
+  private volatile long logicalPlaybackBaseUs;
+  private volatile long playbackStartNs;
+  private volatile long pauseStartedNs;
+  private volatile long relativeSeekBaseUs = NO_SEEK_REQUEST;
+
+  // constructor
   public VideoPlayerModel(
       boolean audioEnabled,
       List<FrameProcessor> frameProcessors,
@@ -108,6 +150,7 @@ public class VideoPlayerModel {
     this.frameProcessors = frameProcessors;
   }
 
+  // play the video file
   public void play(File file) {
     videoFile = file;
     videoDurationUs = NO_SEEK_REQUEST;
@@ -115,6 +158,7 @@ public class VideoPlayerModel {
     startPlayback(0, false, NO_SEEK_REQUEST);
   }
 
+  // back to the start
   public void startOver() {
     if (videoFile == null) {
       return;
@@ -123,14 +167,17 @@ public class VideoPlayerModel {
     seekTo(0);
   }
 
+  // back 5 seconds
   public void backFiveSeconds() {
     seekRelative(-FIVE_SECONDS_US);
   }
 
+  // forward 5 secs
   public void forwardFiveSeconds() {
     seekRelative(FIVE_SECONDS_US);
   }
 
+  // request pause (flip pauseRequested)
   public void togglePause() {
     if (!playbackOpen) {
       if (videoFile != null) {
@@ -152,6 +199,7 @@ public class VideoPlayerModel {
     notifyPlaybackStateChanged();
   }
 
+  // mute and unmute
   public void toggleAudioOutput() {
     audioOutputEnabled = !audioOutputEnabled;
     pendingAudio.clear();
@@ -163,6 +211,7 @@ public class VideoPlayerModel {
     return audioOutputEnabled;
   }
 
+  // close everything
   public void stopPlayback() {
     closePlaybackResources();
     currentTimestampUs = 0;
@@ -174,6 +223,7 @@ public class VideoPlayerModel {
 
   public void shutdown() {
     closePlaybackResources();
+    decodeEffectExecutor.close(); // shutdown the worker as well
   }
 
   private void seekRelative(long offsetUs) {
@@ -196,17 +246,30 @@ public class VideoPlayerModel {
       return;
     }
 
-    try {
-      grabber.setTimestamp(grabTimestampUs);
-      resetPlaybackClock(logicalTimestampUs);
-      flushAudioOutput();
-      prepareNextFrame();
-      notifyPlaybackStateChanged();
-    } catch (Exception e) {
-      handlePlaybackError(e);
+    // discard old frame
+    synchronized (preparedFrameLock) {
+      playbackVersion++;
+      preparedFrame = null;
     }
+
+    long currentFrameVersion = playbackVersion;
+
+    flushAudioOutput();
+
+    decodeEffectExecutor.execute(() -> {
+      try {
+        grabber.setTimestamp(grabTimestampUs);
+        resetPlaybackClock(logicalTimestampUs);
+        prepareNextFrame(currentFrameVersion);
+      } catch (Exception e) {
+        backgroundPlaybackError = e; // handled by the GUI
+      }
+    });
+
+    notifyPlaybackStateChanged();
   }
 
+  // GUI thread
   private void startPlayback(long startTimestampUs, boolean initiallyPaused, long initialRelativeSeekBaseUs) {
     closePlaybackResources();
 
@@ -223,7 +286,7 @@ public class VideoPlayerModel {
       resetPlaybackClock(currentTimestampUs);
       playbackOpen = true;
       playbackTimer.start();
-      prepareNextFrame();
+      submitPreparedNextFrameToWorker();
       notifyPlaybackStateChanged();
     } catch (Exception e) {
       handlePlaybackError(e);
@@ -264,7 +327,6 @@ public class VideoPlayerModel {
 
   private void resetPlaybackClock(long logicalTimestampUs) {
     pendingAudio.clear();
-    preparedFrame = null;
     currentTimestampUs = logicalTimestampUs;
     relativeSeekBaseUs = logicalTimestampUs;
     firstTimestampUs = NO_SEEK_REQUEST;
@@ -280,15 +342,50 @@ public class VideoPlayerModel {
     pauseStartedNs = 0;
   }
 
-  private void prepareNextFrame() {
+  private void submitPreparedNextFrameToWorker() {
+    if (framePreparationInProgress) {
+      return;
+    }
+
+    framePreparationInProgress = true;
+
+    // remember the current frame before sending to the worker
+    long currentFrameVersion = playbackVersion;
+
+    // posting
+    decodeEffectExecutor.execute(() -> {
+      try {
+        if (!pauseRequested) { // re-check if the user has clicked pause or not
+          prepareNextFrame(currentFrameVersion);
+        }
+      } finally {
+        framePreparationInProgress = false; // job done -> GUI may post the next one
+      }
+    });
+
+  }
+
+  private void prepareNextFrame(long frameGeneration) {
     if (!playbackOpen || preparedFrame != null) {
       return;
     }
 
     try {
-      preparedFrame = readNextVideoFrame();
+      PreparedFrame nextFrame = readNextVideoFrame();
+
+      if (nextFrame == null) {
+        return;
+      }
+
+      // discard old frame
+      synchronized (preparedFrameLock) {
+        if (playbackVersion == frameGeneration) {
+          preparedFrame = nextFrame;
+        }
+      }
+
     } catch (Exception e) {
-      handlePlaybackError(e);
+      backgroundPlaybackError = e; // handled by the GUI
     }
   }
 
@@ -296,7 +393,7 @@ public class VideoPlayerModel {
     while (playbackOpen) {
       Frame frame = grabFrame();
       if (frame == null) {
-        finishPlayback();
+        videoEnded = true;
         return null;
       }
 
@@ -370,6 +467,19 @@ public class VideoPlayerModel {
       return;
     }
 
+    // display the error if caught any
+    if (backgroundPlaybackError != null) {
+      Exception e = backgroundPlaybackError;
+      backgroundPlaybackError = null;
+      handlePlaybackError(e);
+      return;
+    }
+
+    if (videoEnded) {
+      finishPlayback();
+      return;
+    }
+
     // Task (1)
     writeDueAudio(now);
 
@@ -383,25 +493,22 @@ public class VideoPlayerModel {
     // Task (3). We'll try and be nice to the GUI event loop here by queueing the
     // prepareNextFrame call rather than
     // hogging the thread and doing it here, hence the tricky callback and use of
-    // prepareNextFrameQueued. Feel free
-    // to replace this whole block with simple linear control flow logic
-    // such as: if (!pauseRequested && preparedFrame == null) prepareNextFrame();
-    // to compare.
-    if (!pauseRequested && preparedFrame == null && !prepareNextFrameQueued) {
-      prepareNextFrameQueued = true;
-      Platform.runLater(() -> {
-        prepareNextFrameQueued = false;
-
-        if (!pauseRequested) {
-          prepareNextFrame();
-        }
-      });
+    if (!pauseRequested && preparedFrame == null) {
+      submitPreparedNextFrameToWorker(); // the job goes to the worker --> decoding + effects no longer eat the GUI
+                                         // thread's time
     }
   }
 
   private void displayPreparedFrame(long now) {
-    PreparedFrame frame = preparedFrame;
-    preparedFrame = null;
+    PreparedFrame frame;
+
+    // take the frame out through the lock, so we can never grab it
+    // at the same moment the worker is swapping in a new one.
+
+    synchronized (preparedFrameLock) {
+      frame = preparedFrame;
+      preparedFrame = null;
+    }
     currentTimestampUs = frame.logicalTimestampUs();
     relativeSeekBaseUs = NO_SEEK_REQUEST;
 
@@ -424,7 +531,10 @@ public class VideoPlayerModel {
   }
 
   private void queueAudio(long timestampUs, Frame frame) {
-    if (!audioOutputEnabled || audioPlayer == null) {
+
+    AudioPlayer player = audioPlayer;
+
+    if (!audioOutputEnabled || player == null) {
       return;
     }
 
@@ -489,7 +599,13 @@ public class VideoPlayerModel {
   private void closePlaybackResources() {
     playbackTimer.stop();
     playbackOpen = false;
-    preparedFrame = null;
+    framePreparationInProgress = false;
+
+    synchronized (preparedFrameLock) {
+      playbackVersion++;
+      preparedFrame = null;
+    }
+
     pendingAudio.clear();
     firstTimestampUs = NO_SEEK_REQUEST;
     playbackStartNs = 0;
@@ -502,6 +618,30 @@ public class VideoPlayerModel {
       audioPlayer = null;
     }
 
+    // (B4) Grabber + converter are worker-owned: the worker closes them,
+    // after whatever it is doing right now (FIFO order), and we wait.
+    try {
+      decodeEffectExecutor.submit(() -> {
+        closeGrabberNow();
+        closeConverterNow();
+      }).get();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    } catch (Exception e) {
+      // Teardown is best-effort; the worker is a daemon thread, so a
+      // failure here can never stop the application from exiting.
+    }
+  }
+
+  private void closeConverterNow() {
+    if (converter != null) {
+      converter.close();
+      converter = null;
+    }
+
+  }
+
+  private void closeGrabberNow() {
     if (grabber != null) {
       try {
         grabber.stop();
@@ -514,11 +654,6 @@ public class VideoPlayerModel {
         // The resource is being closed; there is no useful recovery action.
       }
       grabber = null;
-    }
-
-    if (converter != null) {
-      converter.close();
-      converter = null;
     }
   }
 
