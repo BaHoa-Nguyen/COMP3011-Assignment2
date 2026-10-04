@@ -17,6 +17,7 @@ import comp3011.media.InfoVideo;
 import java.io.File;
 
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Queue;
 
 // split the decode + effect into a separate worker thread
@@ -24,6 +25,8 @@ import java.util.Queue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -52,23 +55,29 @@ public class VideoPlayerModel {
   private static final long NO_SEEK_REQUEST = -1; // Sentinel value used when no seek position is active.
   private static final long FIVE_SECONDS_US = 5_000_000L; // calculated in MicroSeconds
   private static final long AUDIO_LEAD_NS = 30_000_000L;
-
-  // decode + effect thread
-  private final ExecutorService decodeEffectExecutor = Executors.newSingleThreadExecutor(runnable -> {
-    Thread decodeEffectThread = new Thread(runnable, "decode-worker");
-    decodeEffectThread.setDaemon(true); // allow JVM exiting normally
-    return decodeEffectThread;
-  });
+  private static final int QUEUE_CAPACITY = 4; // Cap the size of the waiting queue to 4 frames max
+  private static final FramePacket END_PACKET = new FramePacket(null, 0, -1, 0); // mark the end of the video
 
   // Protects access to the prepared frame shared between threads.
   private final Object preparedFrameLock = new Object();
 
+  // each worker will have its own effect, and between the workers there would be
+  // a waiting queue
+  // the decoded frame will be in the waitingQueues 0
+  private final List<ArrayBlockingQueue<FramePacket>> waitingQueues;
+
+  // the number of stages the frame will undergo
+  private final int stageCount;
+  private ExecutorService pipeline;
+
+  // GUI -> decode worker: where to seek next. Written BEFORE the version
+  // bump in seekTo(); the decode loop reads playbackVersion first, then
+  // this, so a packet can never carry the new version with the old position.
+  private volatile long pendingSeekUs = NO_SEEK_REQUEST;
+
   // Version of the current playback session.
   // Incremented when seeking or closing so old frames can be discarded.
   private volatile long playbackVersion = 0;
-
-  // True while a frame-preparation job is queued or being processed.
-  private volatile boolean framePreparationInProgress = false;
 
   // True when the decoder has reached the end of the video.
   private volatile boolean videoEnded = false;
@@ -119,7 +128,7 @@ public class VideoPlayerModel {
   private volatile boolean pauseRequested; // request pause
   private volatile boolean audioOutputEnabled;
   private volatile boolean audioAvailable;
-  private volatile boolean frameProcessorsInitialised;
+
   private volatile long currentTimestampUs; // where we are in the video (e.g. 4:00)
   private volatile long videoDurationUs = NO_SEEK_REQUEST;
   private volatile int videoFrameDurationUs;
@@ -148,6 +157,13 @@ public class VideoPlayerModel {
     this.playbackStateChangedHandler = playbackStateChangedHandler;
     this.audioOutputStateChangedHandler = audioOutputStateChangedHandler;
     this.frameProcessors = frameProcessors;
+    this.stageCount = frameProcessors.size() + 1; // each worker has its own frame + the final worker doing the convert
+                                                  // and publish.
+    this.waitingQueues = new ArrayList<>(stageCount); // create the container
+    // build up the assembly line
+    for (int stageIndex = 0; stageIndex < stageCount; stageIndex++) {
+      waitingQueues.add(new ArrayBlockingQueue<>(QUEUE_CAPACITY));
+    }
   }
 
   // play the video file
@@ -223,7 +239,206 @@ public class VideoPlayerModel {
 
   public void shutdown() {
     closePlaybackResources();
-    decodeEffectExecutor.close(); // shutdown the worker as well
+  }
+
+  private boolean offerToQueue(ArrayBlockingQueue<FramePacket> waitingQueue, FramePacket framePacket)
+      throws InterruptedException {
+    while (playbackOpen) {
+      if (waitingQueue.offer(framePacket, 50, TimeUnit.MILLISECONDS)) {
+        return true;
+      }
+    }
+    return false;
+
+  }
+
+  private void decodeFrame() {
+    try {
+      while (playbackOpen) {
+
+        // check if the user wants to seek or not
+        long packetVersion = playbackVersion;
+        long seekUs = pendingSeekUs;
+
+        // seek requested
+        if (seekUs != NO_SEEK_REQUEST) {
+          pendingSeekUs = NO_SEEK_REQUEST; // mark the request handled
+          grabber.setTimestamp(seekUs);
+        }
+
+        Frame frame = grabFrame();
+
+        // video not playing
+        if (!playbackOpen) {
+          return;
+        }
+
+        // reach the end of the video
+        if (frame == null) {
+          offerToQueue(waitingQueues.get(0), END_PACKET);
+          return;
+        }
+
+        long timestampUs = grabber.getTimestamp();
+
+        // if there is audio and the frame contains the audio data
+        if (audioAvailable && frame.samples != null) {
+          queueAudio(timestampUs, frame);
+        }
+
+        // skip frames that does not contain images
+        if (frame.image == null) {
+          continue;
+        }
+
+        // grab() override the existing frame data, which could corrupt the pipeline
+        // we need to use .clone() here to avoid that
+        // Reference:
+        // https://boofcv.org/javadoc/org/bytedeco/copiedstuff/FFmpegFrameGrabber.html#grab()
+        FramePacket clonedPacket = new FramePacket(
+            frame.clone(),
+            timestampUs,
+            grabber.getFrameNumber(),
+            packetVersion);
+
+        if (!offerToQueue(waitingQueues.get(0), clonedPacket)) {
+          return;
+        }
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    } catch (Exception e) {
+      if (playbackOpen) {
+        backgroundPlaybackError = e;
+      }
+    }
+  }
+
+  private void processDecodedFrame(int stageIndex) {
+    ArrayBlockingQueue<FramePacket> currentWaitingQueue = waitingQueues.get(stageIndex);
+
+    boolean isLastStage = stageIndex == stageCount - 1;
+
+    ArrayBlockingQueue<FramePacket> nextWaitingQueue = isLastStage ? null : waitingQueues.get(stageIndex + 1);
+
+    FrameProcessor frameProcessor = stageIndex < frameProcessors.size() ? frameProcessors.get(stageIndex) : null;
+
+    boolean isProcessorInitialised = false;
+
+    try {
+      while (playbackOpen) {
+        FramePacket framePacket = currentWaitingQueue.poll(50, TimeUnit.MILLISECONDS);
+
+        if (framePacket == null) {
+          continue;
+        }
+
+        if (framePacket == END_PACKET) {
+          if (isLastStage) {
+            videoEnded = true;
+            return;
+          }
+
+          offerToQueue(nextWaitingQueue, END_PACKET);
+          return;
+
+        }
+
+        if (frameProcessor != null) {
+          if (!isProcessorInitialised) {
+            frameProcessor.initialise(new InfoVideo(
+                mediaName(videoFile),
+                totalVideoFrames,
+                framePacket.frame().imageWidth,
+                framePacket.frame().imageHeight,
+                framePacket.frame().imageDepth,
+                framePacket.frame().imageChannels,
+                framePacket.frame().imageStride,
+                frameRate,
+                intFrameRate,
+                videoFrameDurationUs,
+                grabber.getPixelFormat()));
+
+            isProcessorInitialised = true;
+          }
+
+          frameProcessor.process(framePacket.frame(),
+              new InfoFrame(framePacket.frameNumber(), framePacket.timestampUs()));
+        }
+
+        if (!isLastStage) {
+          if (!offerToQueue(nextWaitingQueue, framePacket)) {
+            return;
+          }
+          continue;
+        }
+
+        // convert and publish the processed frame one by one
+        Image image = converter.convert(framePacket.frame());
+        long readyNs = System.nanoTime();
+
+        synchronized (preparedFrameLock) {
+          while (playbackOpen && (pauseRequested || preparedFrame != null)) {
+            preparedFrameLock.wait(50);
+          }
+
+          if (!playbackOpen) {
+            return;
+          }
+
+          if (framePacket.version() != playbackVersion) {
+            continue;
+          }
+
+          // first frame of current playback
+          if (firstTimestampUs == NO_SEEK_REQUEST) {
+            firstTimestampUs = framePacket.timestampUs();
+            playbackStartNs = System.nanoTime();
+            if (pauseRequested) {
+              pauseStartedNs = playbackStartNs;
+            }
+          }
+
+          long relativeTimestampUs = Math.max(0, framePacket.timestampUs() - firstTimestampUs);
+          long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
+          long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
+
+          preparedFrame = new PreparedFrame(
+              image,
+              framePacket.frameNumber(),
+              framePacket.timestampUs(),
+              logicalTimestampUs,
+              targetTimeNs,
+              readyNs);
+
+        }
+
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    } catch (Exception e) {
+      if (playbackOpen) {
+        backgroundPlaybackError = e;
+      }
+    }
+
+  }
+
+  // start our pipeline
+  private void startPipeline() {
+    pipeline = Executors.newFixedThreadPool(stageCount + 1, runnable -> {
+      Thread thread = new Thread(runnable);
+      thread.setDaemon(true);
+      return thread;
+    });
+
+    pipeline.execute(this::decodeFrame);
+
+    for (int stageIndex = 0; stageIndex < stageCount; stageIndex++) {
+      final int lambdaIndex = stageIndex;
+      pipeline.execute(() -> processDecodedFrame(lambdaIndex));
+    }
+
   }
 
   private void seekRelative(long offsetUs) {
@@ -241,31 +456,28 @@ public class VideoPlayerModel {
     long logicalTimestampUs = clampSeekTimestamp(timestampUs);
     long grabTimestampUs = displayableSeekTimestamp(logicalTimestampUs);
 
-    if (!playbackOpen) {
+    if (!playbackOpen || videoEnded) {
       startPlayback(grabTimestampUs, pauseRequested, logicalTimestampUs);
       return;
     }
+
+    pendingSeekUs = grabTimestampUs;
 
     // discard old frame
     synchronized (preparedFrameLock) {
       playbackVersion++;
       preparedFrame = null;
+      resetPlaybackClock(logicalTimestampUs);
+      preparedFrameLock.notifyAll();
     }
 
-    long currentFrameVersion = playbackVersion;
+    // when the user seek to another timestamp, the current frames in the queue are
+    // old so we discard them in the queue
+    for (ArrayBlockingQueue<FramePacket> waitingQueue : waitingQueues) {
+      waitingQueue.clear();
+    }
 
     flushAudioOutput();
-
-    decodeEffectExecutor.execute(() -> {
-      try {
-        grabber.setTimestamp(grabTimestampUs);
-        resetPlaybackClock(logicalTimestampUs);
-        prepareNextFrame(currentFrameVersion);
-      } catch (Exception e) {
-        backgroundPlaybackError = e; // handled by the GUI
-      }
-    });
-
     notifyPlaybackStateChanged();
   }
 
@@ -286,7 +498,7 @@ public class VideoPlayerModel {
       resetPlaybackClock(currentTimestampUs);
       playbackOpen = true;
       playbackTimer.start();
-      submitPreparedNextFrameToWorker();
+      startPipeline();
       notifyPlaybackStateChanged();
     } catch (Exception e) {
       handlePlaybackError(e);
@@ -342,115 +554,6 @@ public class VideoPlayerModel {
     pauseStartedNs = 0;
   }
 
-  private void submitPreparedNextFrameToWorker() {
-    if (framePreparationInProgress) {
-      return;
-    }
-
-    framePreparationInProgress = true;
-
-    // remember the current frame before sending to the worker
-    long currentFrameVersion = playbackVersion;
-
-    // posting
-    decodeEffectExecutor.execute(() -> {
-      try {
-        if (!pauseRequested) { // re-check if the user has clicked pause or not
-          prepareNextFrame(currentFrameVersion);
-        }
-      } finally {
-        framePreparationInProgress = false; // job done -> GUI may post the next one
-      }
-    });
-
-  }
-
-  private void prepareNextFrame(long frameGeneration) {
-    if (!playbackOpen || preparedFrame != null) {
-      return;
-    }
-
-    try {
-      PreparedFrame nextFrame = readNextVideoFrame();
-
-      if (nextFrame == null) {
-        return;
-      }
-
-      // discard old frame
-      synchronized (preparedFrameLock) {
-        if (playbackVersion == frameGeneration) {
-          preparedFrame = nextFrame;
-        }
-      }
-
-    } catch (Exception e) {
-      backgroundPlaybackError = e; // handled by the GUI
-    }
-  }
-
-  private PreparedFrame readNextVideoFrame() throws Exception {
-    while (playbackOpen) {
-      Frame frame = grabFrame();
-      if (frame == null) {
-        videoEnded = true;
-        return null;
-      }
-
-      long timestampUs = grabber.getTimestamp();
-      if (audioAvailable && frame.samples != null) {
-        queueAudio(timestampUs, frame);
-      }
-
-      if (frame.image == null) {
-        continue;
-      }
-
-      if (!frameProcessorsInitialised) {
-        initialiseFrameProcessors(new InfoVideo(
-            mediaName(videoFile),
-            totalVideoFrames,
-            frame.imageWidth,
-            frame.imageHeight,
-            frame.imageDepth,
-            frame.imageChannels,
-            frame.imageStride,
-            frameRate,
-            intFrameRate,
-            videoFrameDurationUs,
-            grabber.getPixelFormat()));
-        frameProcessorsInitialised = true;
-      }
-
-      if (firstTimestampUs == NO_SEEK_REQUEST) {
-        firstTimestampUs = timestampUs;
-        playbackStartNs = System.nanoTime();
-        if (pauseRequested) {
-          pauseStartedNs = playbackStartNs;
-        }
-      }
-
-      int frameNumber = grabber.getFrameNumber();
-      InfoFrame info = new InfoFrame(frameNumber, timestampUs);
-      processFrame(frame, info);
-
-      Image image = converter.convert(frame);
-      long relativeTimestampUs = Math.max(0, timestampUs - firstTimestampUs);
-      long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
-      long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
-
-      return new PreparedFrame(
-          image,
-          frameNumber,
-          timestampUs,
-          logicalTimestampUs,
-          targetTimeNs,
-          System.nanoTime());
-    }
-
-    return null;
-  }
-
   // This is called on a heart beat by the GUI thread. We want to be co-operative
   // here by (a) not blocking, and (b)
   // getting our required work out of the way quickly so that we can return
@@ -475,7 +578,7 @@ public class VideoPlayerModel {
       return;
     }
 
-    if (videoEnded) {
+    if (videoEnded && preparedFrame == null) {
       finishPlayback();
       return;
     }
@@ -490,13 +593,6 @@ public class VideoPlayerModel {
       displayPreparedFrame(now);
     }
 
-    // Task (3). We'll try and be nice to the GUI event loop here by queueing the
-    // prepareNextFrame call rather than
-    // hogging the thread and doing it here, hence the tricky callback and use of
-    if (!pauseRequested && preparedFrame == null) {
-      submitPreparedNextFrameToWorker(); // the job goes to the worker --> decoding + effects no longer eat the GUI
-                                         // thread's time
-    }
   }
 
   private void displayPreparedFrame(long now) {
@@ -538,7 +634,7 @@ public class VideoPlayerModel {
       return;
     }
 
-    byte[] samples = audioPlayer.copySamples(frame);
+    byte[] samples = player.copySamples(frame);
     if (samples.length > 0) {
       pendingAudio.add(new PendingAudio(timestampUs, samples));
     }
@@ -599,11 +695,17 @@ public class VideoPlayerModel {
   private void closePlaybackResources() {
     playbackTimer.stop();
     playbackOpen = false;
-    framePreparationInProgress = false;
+    pendingSeekUs = NO_SEEK_REQUEST;
+    videoEnded = false;
 
     synchronized (preparedFrameLock) {
       playbackVersion++;
       preparedFrame = null;
+      preparedFrameLock.notifyAll();
+    }
+
+    for (ArrayBlockingQueue<FramePacket> waitingQueue : waitingQueues) {
+      waitingQueue.clear();
     }
 
     pendingAudio.clear();
@@ -611,25 +713,25 @@ public class VideoPlayerModel {
     playbackStartNs = 0;
     pauseStartedNs = 0;
     audioAvailable = false;
-    frameProcessorsInitialised = false;
+
+    if (pipeline != null) {
+      pipeline.shutdown();
+
+      try {
+        pipeline.awaitTermination(2, TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+
+      pipeline = null;
+    }
+
+    closeGrabberNow();
+    closeConverterNow();
 
     if (audioPlayer != null) {
       audioPlayer.close();
       audioPlayer = null;
-    }
-
-    // (B4) Grabber + converter are worker-owned: the worker closes them,
-    // after whatever it is doing right now (FIFO order), and we wait.
-    try {
-      decodeEffectExecutor.submit(() -> {
-        closeGrabberNow();
-        closeConverterNow();
-      }).get();
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-    } catch (Exception e) {
-      // Teardown is best-effort; the worker is a daemon thread, so a
-      // failure here can never stop the application from exiting.
     }
   }
 
@@ -689,19 +791,6 @@ public class VideoPlayerModel {
     return Math.max(0, durationUs - frameDurationUs);
   }
 
-  // process all the available frame in the ArrayList
-  private void processFrame(Frame frame, InfoFrame info) throws Exception {
-    for (FrameProcessor processor : frameProcessors) {
-      processor.process(frame, info);
-    }
-  }
-
-  private void initialiseFrameProcessors(InfoVideo videoInfo) throws Exception {
-    for (FrameProcessor processor : frameProcessors) {
-      processor.initialise(videoInfo);
-    }
-  }
-
   private Frame grabFrame() throws Exception {
     if (audioAvailable) {
       return grabber.grab();
@@ -735,47 +824,4 @@ public class VideoPlayerModel {
     audioOutputStateChangedHandler.accept(audioOutputEnabled);
   }
 
-  private record PreparedFrame(
-      Image image,
-      int frameNumber,
-      long mediaTimestampUs,
-      long logicalTimestampUs,
-      long targetTimeNs,
-      long preparedAtNs) {
-  }
-
-  private static class PendingAudio {
-    private final long timestampUs;
-    private final byte[] samples;
-    private int offset;
-
-    PendingAudio(long timestampUs, byte[] samples) {
-      this.timestampUs = timestampUs;
-      this.samples = samples;
-    }
-
-    long timestampUs() {
-      return timestampUs;
-    }
-
-    byte[] samples() {
-      return samples;
-    }
-
-    int offset() {
-      return offset;
-    }
-
-    int remaining() {
-      return samples.length - offset;
-    }
-
-    void advance(int byteCount) {
-      offset += byteCount;
-    }
-
-    boolean finished() {
-      return offset >= samples.length;
-    }
-  }
 }
