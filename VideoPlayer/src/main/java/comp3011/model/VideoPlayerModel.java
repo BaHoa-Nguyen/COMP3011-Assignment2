@@ -4,15 +4,15 @@
  *
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Ba Hoa Nguyen - a1938499, in collaboration with Muse Spark 1.3 Free
  *
  * Copyright 2026 Simon Ratcliffe
  */
 package comp3011.model;
 
 import comp3011.effects.FrameProcessor;
-import comp3011.media.InfoFrame;
-import comp3011.media.InfoVideo;
+import comp3011.dto.InfoFrame;
+import comp3011.dto.InfoVideo;
 
 import java.io.File;
 
@@ -45,10 +45,14 @@ import javafx.scene.image.Image;
  *
  * <p>
  * Owns the FFmpeg decoder, playback clock, seeking logic, audio scheduling,
- * and frame processing - which it all manages through cooperative multi-tasking
- * on a single thread. It publishes decoded frames and playback state through
- * callbacks supplied by its owning {@link VideoPlayerController}, keeping it
- * decoupled from the JavaFX view.
+ * and frame processing through an ordered multi-threading pipeline:
+ * decode -&gt; effect[0] -&gt ... -&gt; effect[n-1] -&gt; convert then publish
+ * in the final thread
+ * Each worker owns one effect only, and once it has finished applying the
+ * frame, it will forward the frame to the next worker thread over a bounded
+ * queue. The JavaFX thread only displays due frames and drains audio, so the
+ * GUI never blocks on decode/effects/convert. Order and repeats come from the
+ * CLI list; see EFFECTS in {@link CommandLineController}.
  * </p>
  */
 public class VideoPlayerModel {
@@ -113,8 +117,9 @@ public class VideoPlayerModel {
     }
   };
 
-  // since we split into 2 threads, the threads need to be kept updated with the
-  // lastest value of most of these variables --> use the volatile keyword for
+  // since we use multi-threading, all the threads need to be kept updated with
+  // the
+  // lastest value of most of these variables --> use the "volatile"" keyword for
   // this purpose
 
   private volatile File videoFile; // Path to the media that comes from the command line
@@ -157,7 +162,8 @@ public class VideoPlayerModel {
     this.playbackStateChangedHandler = playbackStateChangedHandler;
     this.audioOutputStateChangedHandler = audioOutputStateChangedHandler;
     this.frameProcessors = frameProcessors;
-    this.stageCount = frameProcessors.size() + 1; // each worker has its own frame + the final worker doing the convert
+    this.stageCount = frameProcessors.size() + 1; // each worker has its own frame + the final worker (the +1 part)
+                                                  // doing the convert
                                                   // and publish.
     this.waitingQueues = new ArrayList<>(stageCount); // create the container
     // build up the assembly line
@@ -252,6 +258,9 @@ public class VideoPlayerModel {
 
   }
 
+  // The decode worker decode the video in Frames and place them into waiting
+  // queue 0, where the effect worker will grab those frames and apply effect to
+  // them
   private void decodeFrame() {
     try {
       while (playbackOpen) {
@@ -314,6 +323,11 @@ public class VideoPlayerModel {
     }
   }
 
+  // This method will concurrently take the frame from the waiting queue and apply
+  // the effect to them.
+  // The number of workers are based on the number of effects coming from the CLI
+  // plus the final worker to convert and publish the processed frame to the GUI
+  // thread one-by-one.
   private void processDecodedFrame(int stageIndex) {
     ArrayBlockingQueue<FramePacket> currentWaitingQueue = waitingQueues.get(stageIndex);
 
@@ -378,6 +392,9 @@ public class VideoPlayerModel {
         long readyNs = System.nanoTime();
 
         synchronized (preparedFrameLock) {
+          // if the the playback is open but
+          // (a) the video is pause or (b) there's a frame in the queue
+          // then we wait for 50ms
           while (playbackOpen && (pauseRequested || preparedFrame != null)) {
             preparedFrameLock.wait(50);
           }
@@ -527,6 +544,7 @@ public class VideoPlayerModel {
         : NO_SEEK_REQUEST;
 
     audioAvailable = grabber.hasAudio();
+
     audioPlayer = new AudioPlayer();
     if (audioAvailable) {
       audioPlayer.open(grabber.getSampleRate(), grabber.getAudioChannels());
@@ -538,33 +556,34 @@ public class VideoPlayerModel {
   }
 
   private void resetPlaybackClock(long logicalTimestampUs) {
-    pendingAudio.clear();
-    currentTimestampUs = logicalTimestampUs;
-    relativeSeekBaseUs = logicalTimestampUs;
-    firstTimestampUs = NO_SEEK_REQUEST;
-    logicalPlaybackBaseUs = logicalTimestampUs;
-    playbackStartNs = 0;
-    pauseStartedNs = pauseRequested ? System.nanoTime() : 0;
-  }
-
-  private void resumePlaybackClock(long now) {
-    if (pauseStartedNs > 0 && playbackStartNs > 0) {
-      playbackStartNs += now - pauseStartedNs;
+    // this writes 7 clock fields so synchronized here prevent the reader from
+    // reading mid-write of the writer
+    synchronized (preparedFrameLock) {
+      pendingAudio.clear();
+      currentTimestampUs = logicalTimestampUs;
+      relativeSeekBaseUs = logicalTimestampUs;
+      firstTimestampUs = NO_SEEK_REQUEST;
+      logicalPlaybackBaseUs = logicalTimestampUs;
+      playbackStartNs = 0;
+      pauseStartedNs = pauseRequested ? System.nanoTime() : 0;
     }
-    pauseStartedNs = 0;
+
   }
 
-  // This is called on a heart beat by the GUI thread. We want to be co-operative
-  // here by (a) not blocking, and (b)
-  // getting our required work out of the way quickly so that we can return
-  // control flow to the JavaFX event loop for
-  // handling user interaction with the GUI and rendering. We have three jobs: (1)
-  // keep audio flowing if sound is on,
-  // (2) display a frame if it is due and (3) prepare the next frame if we're in
-  // the window after the previous frame
-  // has gone to the display. We don't buffer frames here, just handling them one
-  // at a time. Not a great architecture,
-  // living on the edge a bit, but can't do much better on a single thread.
+  // moves the start anchor forward by the pause seconds, so the video time
+  // continues where it froze instead of jumping ahead
+  private void resumePlaybackClock(long now) {
+    synchronized (preparedFrameLock) {
+      if (pauseStartedNs > 0 && playbackStartNs > 0) {
+        playbackStartNs += now - pauseStartedNs;
+      }
+      pauseStartedNs = 0;
+    }
+  }
+
+  // FX heartbeat only. The heavy work has been deligated to the workers.
+  // Workers do decode/effects/convert off-thread and publish a single
+  // preparedFrame under preparedFrameLock. We consume it here
   private void pumpPlayback(long now) {
     if (!playbackOpen) {
       return;
@@ -604,9 +623,9 @@ public class VideoPlayerModel {
     synchronized (preparedFrameLock) {
       frame = preparedFrame;
       preparedFrame = null;
+      currentTimestampUs = frame.logicalTimestampUs();
+      relativeSeekBaseUs = NO_SEEK_REQUEST;
     }
-    currentTimestampUs = frame.logicalTimestampUs();
-    relativeSeekBaseUs = NO_SEEK_REQUEST;
 
     // Dump some logging to the console once per second so that real time
     // performance can be monitored.
@@ -646,12 +665,20 @@ public class VideoPlayerModel {
       pendingAudio.clear();
       return;
     }
-    if (pauseRequested || firstTimestampUs == NO_SEEK_REQUEST || playbackStartNs <= 0) {
+
+    long snapFirst, snapStart;
+
+    synchronized (preparedFrameLock) {
+      snapFirst = firstTimestampUs;
+      snapStart = playbackStartNs;
+    }
+
+    if (pauseRequested || snapFirst == NO_SEEK_REQUEST || snapStart <= 0) {
       return;
     }
 
     // Here is the real time dependent logic
-    long dueTimestampUs = firstTimestampUs + (now + AUDIO_LEAD_NS - playbackStartNs) / 1_000L;
+    long dueTimestampUs = snapFirst + (now + AUDIO_LEAD_NS - snapStart) / 1_000L;
     while (!pendingAudio.isEmpty()) {
       PendingAudio audio = pendingAudio.peek();
       if (audio.timestampUs() > dueTimestampUs) {
