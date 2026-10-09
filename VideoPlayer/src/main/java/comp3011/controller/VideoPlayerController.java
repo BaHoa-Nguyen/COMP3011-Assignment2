@@ -9,6 +9,7 @@
  * Copyright 2026 Simon Ratcliffe
  */
 package comp3011.controller;
+
 import comp3011.model.VideoPlayerModel;
 import comp3011.view.VideoPlayerView;
 import comp3011.effects.FrameProcessor;
