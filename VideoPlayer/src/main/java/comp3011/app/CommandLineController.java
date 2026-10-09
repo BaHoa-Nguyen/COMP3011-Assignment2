@@ -4,7 +4,7 @@
  *
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. Ba Hoa Nguyen - a1938499
+ *   2. Ba Hoa Nguyen - a1938499, in collaboration with Muse Spark 1.3 free
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -23,12 +23,12 @@ import comp3011.effects.FrameMottler;
 import comp3011.effects.FrameBleeder;
 import comp3011.effects.FramePepperer;
 
+import comp3011.dto.CommandOption;
+import comp3011.dto.FrameEffectOption;
+
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
-
-import java.util.Map;
-import java.util.function.Supplier;
 
 /**
  * Created in the VideoPlayerApp's main function to receive and parse the video
@@ -54,58 +54,98 @@ public class CommandLineController {
   // storing the effects
   private List<FrameProcessor> frameProcessors = new ArrayList<>();
 
-  // use a Map + Supplier for faster lookup of the frame instead of a chaining
-  // if-else
-  private final Map<String, Supplier<FrameProcessor>> frameProcessorMap = Map.ofEntries(
-      Map.entry("-n", FrameNumberer::new),
-      Map.entry("--number-frames", FrameNumberer::new),
+  // Since we only have 5 options and 11 effects for now, using a List would
+  // iterate at most 11
+  // times effects and at most 5 for options, which is O(n) in both case, and is
+  // negligible in terms of performance. If in the future, more options and/or
+  // more frames are added, then we can consider using a Map for faster lookup
+  private final List<CommandOption> OPTIONS = List.of(
+      new CommandOption("-h", "--help",
+          () -> helpRequested = true,
+          "Show this help message"),
 
-      Map.entry("-s", FrameScratcher::new),
-      Map.entry("--scratch-frames", FrameScratcher::new),
+      new CommandOption("-a", "--audio",
+          () -> audioRequested = true,
+          "Play audio"),
 
-      Map.entry("-f", FrameFlickerer::new),
-      Map.entry("--flicker-frames", FrameFlickerer::new),
+      new CommandOption("-x", "--maximise",
+          () -> maximiseRequested = true,
+          "Open the player maximised"),
 
-      Map.entry("-w", FrameBlackAndWhiter::new),
-      Map.entry("--black-and-white", FrameBlackAndWhiter::new),
+      new CommandOption("-1", "--monitor-1",
+          () -> setDisplayId(1),
+          "Open the player on display 1"),
 
-      Map.entry("-y", FrameYellower::new),
-      Map.entry("--yellow-frames", FrameYellower::new),
+      new CommandOption("-2", "--monitor-2",
+          () -> setDisplayId(2),
+          "Open the player on display 2"));
 
-      Map.entry("-v", FrameVignetter::new),
-      Map.entry("--vignette-frame", FrameVignetter::new),
+  private final List<FrameEffectOption> EFFECTS = List.of(
+      new FrameEffectOption(
+          "-n",
+          "--number-frames",
+          FrameNumberer::new,
+          "Render the frame number onto each frame"),
 
-      Map.entry("-d", FrameDuster::new),
-      Map.entry("--dust-frame", FrameDuster::new),
+      new FrameEffectOption(
+          "-s",
+          "--scratch-frames",
+          FrameScratcher::new,
+          "Render vertical film scratches"),
 
-      Map.entry("-j", FrameJitterer::new),
-      Map.entry("--jitter-frames", FrameJitterer::new),
+      new FrameEffectOption(
+          "-f",
+          "--flicker-frames",
+          FrameFlickerer::new,
+          "Randomly dim frames"),
 
-      Map.entry("-m", FrameMottler::new),
-      Map.entry("--mottle-frames", FrameMottler::new),
+      new FrameEffectOption(
+          "-w",
+          "--black-and-white",
+          FrameBlackAndWhiter::new,
+          "Convert frames to black and white"),
 
-      Map.entry("-b", FrameBleeder::new),
-      Map.entry("--bleed-frames", FrameBleeder::new),
+      new FrameEffectOption(
+          "-y",
+          "--yellow-frames",
+          FrameYellower::new,
+          "Apply a warmer colour temperature"),
 
-      Map.entry("-p", FramePepperer::new),
-      Map.entry("--pepper-frames", FramePepperer::new));
+      new FrameEffectOption(
+          "-v",
+          "--vignette-frames",
+          FrameVignetter::new,
+          "Darken the frame edges"),
 
-  // use Map to avoid long if-else chaining
-  private final Map<String, Runnable> optionMap = Map.of(
-      "-h", () -> helpRequested = true,
-      "--help", () -> helpRequested = true,
+      new FrameEffectOption(
+          "-d",
+          "--dust-frames",
+          FrameDuster::new,
+          "Render dust and hair marks"),
 
-      "-a", () -> audioRequested = true,
-      "--audio", () -> audioRequested = true,
+      new FrameEffectOption(
+          "-j",
+          "--jitter-frames",
+          FrameJitterer::new,
+          "Randomly displace frames by a few pixels"),
 
-      "-x", () -> maximiseRequested = true,
-      "--maximise", () -> maximiseRequested = true,
+      new FrameEffectOption(
+          "-m",
+          "--mottle-frames",
+          FrameMottler::new,
+          "Add cloudy emulsion mottling"),
 
-      "-1", () -> setDisplayId(1),
-      "--monitor-1", () -> setDisplayId(1),
+      new FrameEffectOption(
+          "-b",
+          "--bleed-frames",
+          FrameBleeder::new,
+          "Bleed light into frames"),
 
-      "-2", () -> setDisplayId(2),
-      "--monitor-2", () -> setDisplayId(2));
+      new FrameEffectOption(
+          "-p",
+          "--pepper-frames",
+          FramePepperer::new,
+          "Pepper frames with dark spots/blotches"));
 
   public CommandLineController(String[] args) {
     this.args = args.clone();
@@ -167,8 +207,12 @@ public class CommandLineController {
   private List<String> stackFrameProcessor() {
     List<String> stackedProcessors = new ArrayList<>();
 
+    // the CLI command looks like: -njpbw, --jitter-frames --number-frames, etc
+    // so the regex for the stacked frames would be: the string must start with a
+    // hyphen (-), followed by
+    // one or more lowercase English letters, and nothing else.
     for (String arg : args) {
-      if (arg.matches("^-[a-z]{2,}$")) {
+      if (arg.matches("^-[a-z]{1,}$")) {
         for (int argIndex = 1; argIndex < arg.length(); argIndex++) {
           stackedProcessors.add("-" + arg.charAt(argIndex));
         }
@@ -198,27 +242,25 @@ public class CommandLineController {
 
   // process the arguments
   private void processArgument(String arg, List<String> videoFiles) {
-    Runnable option = optionMap.get(arg);
-
-    // Reference:
-    // https://medium.com/but-it-works-on-my-machine/supplier-t-what-is-it-and-how-to-use-it-in-java-846e8517374a?sk=5d48b62fad246a079716b5c791a55284
-    Supplier<FrameProcessor> frameFactory = frameProcessorMap.get(arg);// use Map to avoid long if-else chaining
-
-    // Map will return null when the key does not exist
-    if (option != null) {
-      option.run();
-      return; // return immediately as option cannot stack as required in the description
+    for (CommandOption commandOption : OPTIONS) {
+      if (arg.equals(commandOption.shortForm()) || arg.equals(commandOption.longForm())) {
+        commandOption.action().run();
+        return;
+      }
     }
 
-    // Map will return null when the key does not exist
-    if (frameFactory != null) {
-      frameProcessors.add(frameFactory.get());
-    } else if (arg.startsWith("-")) {
+    for (FrameEffectOption frameEffectOption : EFFECTS) {
+      if (arg.equals(frameEffectOption.shortForm()) || arg.equals(frameEffectOption.longForm())) {
+        frameProcessors.add(frameEffectOption.factory().get());
+        return;
+      }
+    }
+
+    if (arg.startsWith("-")) {
       errorMessage = "Unknown option: " + arg;
     } else {
       videoFiles.add(arg);
     }
-
   }
 
   private void setDisplayId(int displayId) {
@@ -230,30 +272,40 @@ public class CommandLineController {
   }
 
   private void printHelp() {
+    System.out.println();
     System.out.println("Usage: VideoPlayer [options] [video-file]");
     System.out.println();
     System.out.println("Options:");
-    System.out.println("  -h, --help         Show this help message");
-    System.out.println("  -a, --audio        Play audio");
-    System.out.println("  -x, --maximise     Open the player maximised");
-    System.out.println("  -1, --monitor-1    Open the player on display 1");
-    System.out.println("  -2, --monitor-2    Open the player on display 2");
+
+    for (CommandOption commandOption : OPTIONS) {
+      System.out.printf(
+          "  %-4s %-20s %s%n",
+          commandOption
+              .shortForm() + ",",
+          commandOption
+              .longForm(),
+          commandOption
+              .optionUsageHelp());
+    }
     System.out.println();
     System.out.println("Frame processors:");
-    System.out.println("  -n, --number-frames    Render the frame number onto each frame");
-    System.out.println("  -s, --scratch-frames   Render vertical film scratches");
-    System.out.println("  -f, --flicker-frames   Randomly dim frames");
-    System.out.println("  -w, --black-and-white  Convert frames to black and white");
-    System.out.println("  -y, --yellow-frames    Apply a warmer colour temperature");
-    System.out.println("  -v, --vignette-frame   Darken the frame edges");
-    System.out.println("  -d, --dust-frame       Render dust and hair marks");
-    System.out.println("  -j, --jitter-frames    Randomly displace frames by a few pixels");
-    System.out.println("  -m, --mottle-frames    Add cloudy emulsion mottling");
-    System.out.println("  -b, --bleed-frames     Bleed light into frames");
-    System.out.println("  -p, --pepper-frames    Pepper frames with dark spots/blotches");
+
+    for (FrameEffectOption frameEffectOption : EFFECTS) {
+      System.out.printf(
+          "  %-4s %-20s %s%n",
+          frameEffectOption
+              .shortForm() + ",",
+          frameEffectOption
+              .longForm(),
+          frameEffectOption
+              .commandUsageHelp());
+    }
+
     System.out.println();
     System.out.println("Frame processors are applied in command-line order and may be repeated.");
     System.out.println("Example: -nssnfwyvdjmbp numbers, scratches twice, numbers again, flickers,");
     System.out.println("converts, warms, vignettes, dusts, jitters, mottles, bleeds, then peppers.");
+
+    System.out.println();
   }
 }
