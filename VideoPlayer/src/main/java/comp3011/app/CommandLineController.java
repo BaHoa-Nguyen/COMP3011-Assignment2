@@ -272,14 +272,13 @@ public class CommandLineController {
   }
 
   private void printHelp() {
-    System.out.println();
     System.out.println("Usage: VideoPlayer [options] [video-file]");
     System.out.println();
     System.out.println("Options:");
 
     for (CommandOption commandOption : OPTIONS) {
       System.out.printf(
-          "  %-4s %-20s %s%n",
+          "  %-3s %-15s%s%n",
           commandOption
               .shortForm() + ",",
           commandOption
@@ -292,7 +291,7 @@ public class CommandLineController {
 
     for (FrameEffectOption frameEffectOption : EFFECTS) {
       System.out.printf(
-          "  %-4s %-20s %s%n",
+          "  %-3s %-19s%s%n",
           frameEffectOption
               .shortForm() + ",",
           frameEffectOption
@@ -305,7 +304,5 @@ public class CommandLineController {
     System.out.println("Frame processors are applied in command-line order and may be repeated.");
     System.out.println("Example: -nssnfwyvdjmbp numbers, scratches twice, numbers again, flickers,");
     System.out.println("converts, warms, vignettes, dusts, jitters, mottles, bleeds, then peppers.");
-
-    System.out.println();
   }
 }
