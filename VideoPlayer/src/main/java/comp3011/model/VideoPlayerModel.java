@@ -59,7 +59,18 @@ public class VideoPlayerModel {
   private static final long NO_SEEK_REQUEST = -1; // Sentinel value used when no seek position is active.
   private static final long FIVE_SECONDS_US = 5_000_000L; // calculated in MicroSeconds
   private static final long AUDIO_LEAD_NS = 30_000_000L;
-  private static final int QUEUE_CAPACITY = 4; // Cap the size of the waiting queue to 4 frames max
+
+  // How many frames a stage may leave waiting for the next stage.
+  // Every waiting frame is a full copy of the picture (about 4.6 MB at 1920x800),
+  // and this
+  // number is multiplied by every stage to become the memory the player keeps
+  // alive.
+  // The screen only takes one frame every 41,667 microseconds anyway, so deep
+  // queues never
+  // make playback faster - they only cost memory, garbage collection pauses, and
+  // effects
+  // paid for on frames a seek has already cancelled.
+  private static final int QUEUE_CAPACITY = 2;
   private static final FramePacket END_PACKET = new FramePacket(null, 0, -1, 0); // mark the end of the video
 
   // Protects access to the prepared frame shared between threads.
@@ -578,6 +589,7 @@ public class VideoPlayerModel {
         playbackStartNs += now - pauseStartedNs;
       }
       pauseStartedNs = 0;
+      preparedFrameLock.notifyAll();
     }
   }
 
@@ -623,6 +635,7 @@ public class VideoPlayerModel {
     synchronized (preparedFrameLock) {
       frame = preparedFrame;
       preparedFrame = null;
+      preparedFrameLock.notifyAll();
       currentTimestampUs = frame.logicalTimestampUs();
       relativeSeekBaseUs = NO_SEEK_REQUEST;
     }
