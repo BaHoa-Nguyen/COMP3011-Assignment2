@@ -53,7 +53,7 @@ public class FrameYellower extends FrameProcessor {
       return;
     }
 
-    if (!(frame.image[0] instanceof ByteBuffer pixels)) {
+    if (!(frame.image[0] instanceof ByteBuffer framePixels)) {
       throw new Exception("FrameYellower requires byte-backed image frames");
     }
 
@@ -65,7 +65,9 @@ public class FrameYellower extends FrameProcessor {
       throw new Exception("FrameYellower requires at least three image channels");
     }
 
+    byte[] pixels = copyPixelsFromFrame(framePixels);
     yellowFrame(pixels);
+    copyPixelsBackToFrame(framePixels);
   }
 
   private void buildLookups() {
@@ -119,7 +121,7 @@ public class FrameYellower extends FrameProcessor {
         clamp(blue, 0.0, 255.0));
   }
 
-  private void yellowFrame(ByteBuffer pixels) {
+  private void yellowFrame(byte[] pixels) {
     int height = videoInfo.imageHeight();
     int width = videoInfo.imageWidth();
     int channels = videoInfo.imageChannels();
@@ -130,9 +132,9 @@ public class FrameYellower extends FrameProcessor {
       for (int x = 0; x < width; x++) {
         int base = rowStart + x * channels;
         // JavaCV supplies these decoded frames in BGR byte order.
-        pixels.put(base, blueLookup[Byte.toUnsignedInt(pixels.get(base))]);
-        pixels.put(base + 1, greenLookup[Byte.toUnsignedInt(pixels.get(base + 1))]);
-        pixels.put(base + 2, redLookup[Byte.toUnsignedInt(pixels.get(base + 2))]);
+        pixels[base] = blueLookup[pixels[base] & 0xFF];
+        pixels[base + 1] = greenLookup[pixels[base + 1] & 0xFF];
+        pixels[base + 2] = redLookup[pixels[base + 2] & 0xFF];
       }
     }
   }

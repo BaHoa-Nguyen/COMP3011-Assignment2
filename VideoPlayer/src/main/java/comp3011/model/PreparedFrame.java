@@ -8,5 +8,7 @@ public record PreparedFrame(
     long mediaTimestampUs,
     long logicalTimestampUs,
     long targetTimeNs,
-    long preparedAtNs) {
+    long preparedAtNs,
+    long version) { // playbackVersion captured by the publisher, so display can drop a frame that
+                    // seek/shutdown already invalidated
 }

@@ -4,7 +4,7 @@
  *
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Ba Hoa Nguyen, a1938499, in collaboration with MiMo V2.6 Flash Free
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -95,7 +95,7 @@ public class FrameMottler extends FrameProcessor {
       return;
     }
 
-    if (!(frame.image[0] instanceof ByteBuffer pixels)) {
+    if (!(frame.image[0] instanceof ByteBuffer framePixels)) {
       throw new Exception("FrameMottler requires byte-backed image frames");
     }
 
@@ -113,7 +113,9 @@ public class FrameMottler extends FrameProcessor {
     double damageMaskBlend = (info.frameNumber() % DAMAGE_MASK_BLEND_FRAMES) / (double) DAMAGE_MASK_BLEND_FRAMES;
     ensureDamageMaskFields(damageMaskSegment);
 
+    byte[] pixels = copyPixelsFromFrame(framePixels);
     mottleFrame(pixels, brightnessField, stainField, damageMaskBlend);
+    copyPixelsBackToFrame(framePixels);
   }
 
   private void buildSamplingLookups() {
@@ -274,7 +276,7 @@ public class FrameMottler extends FrameProcessor {
   }
 
   private void mottleFrame(
-      ByteBuffer pixels,
+      byte[] pixels,
       double[] brightnessField,
       double[] stainField,
       double damageMaskBlend) {
@@ -373,7 +375,7 @@ public class FrameMottler extends FrameProcessor {
   }
 
   private void applyMottleBlock(
-      ByteBuffer pixels,
+      byte[] pixels,
       int blockX,
       int blockXEnd,
       int blockY,
@@ -390,9 +392,9 @@ public class FrameMottler extends FrameProcessor {
         int base = rowStart + x * channels;
 
         // JavaCV supplies these decoded frames in BGR byte order.
-        pixels.put(base, blueLookup[Byte.toUnsignedInt(pixels.get(base))]);
-        pixels.put(base + 1, greenLookup[Byte.toUnsignedInt(pixels.get(base + 1))]);
-        pixels.put(base + 2, redLookup[Byte.toUnsignedInt(pixels.get(base + 2))]);
+        pixels[base] = blueLookup[pixels[base] & 0xFF];
+        pixels[base + 1] = greenLookup[pixels[base + 1] & 0xFF];
+        pixels[base + 2] = redLookup[pixels[base + 2] & 0xFF];
       }
     }
   }

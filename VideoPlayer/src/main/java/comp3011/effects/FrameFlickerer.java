@@ -4,7 +4,7 @@
  *
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Ba Hoa Nguyen, a1938499, in collaboration with MiMo V2.6 Flash Free
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -55,7 +55,7 @@ public class FrameFlickerer extends FrameProcessor {
       return;
     }
 
-    if (!(frame.image[0] instanceof ByteBuffer pixels)) {
+    if (!(frame.image[0] instanceof ByteBuffer framePixels)) {
       throw new Exception("FrameFlickerer requires byte-backed image frames");
     }
 
@@ -71,10 +71,12 @@ public class FrameFlickerer extends FrameProcessor {
     double dimmingPercentage = Math.abs(random.nextGaussian()) * FLICKER_PERCENTAGE_SD;
     double brightnessScale = Math.max(0.0, 100.0 - dimmingPercentage) / 100.0;
 
+    byte[] pixels = copyPixelsFromFrame(framePixels);
     dimFrame(pixels, brightnessScale);
+    copyPixelsBackToFrame(framePixels);
   }
 
-  private void dimFrame(ByteBuffer pixels, double brightnessScale) {
+  private void dimFrame(byte[] pixels, double brightnessScale) {
     byte[] dimLookup = new byte[256];
     for (int value = 0; value < dimLookup.length; value++) {
       dimLookup[value] = (byte) clamp((int) Math.round(value * brightnessScale), 0, 255);
@@ -88,7 +90,7 @@ public class FrameFlickerer extends FrameProcessor {
       int rowStart = y * stride;
       for (int offset = 0; offset < widthBytes; offset++) {
         int index = rowStart + offset;
-        pixels.put(index, dimLookup[Byte.toUnsignedInt(pixels.get(index))]);
+        pixels[index] = dimLookup[pixels[index] & 0xFF];
       }
     }
   }

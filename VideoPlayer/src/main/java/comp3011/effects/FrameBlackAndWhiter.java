@@ -22,7 +22,7 @@ import org.bytedeco.javacv.Frame;
  * <p>
  * {@link #process(Frame, InfoFrame)} calculates each pixel's luminance from
  * its BGR channels and writes that value back to every colour channel through
- * {@link #convertFrame(ByteBuffer)}.
+ * {@link #convertFrame(byte[])}.
  * </p>
  */
 public class FrameBlackAndWhiter extends FrameProcessor {
@@ -37,7 +37,7 @@ public class FrameBlackAndWhiter extends FrameProcessor {
       return;
     }
 
-    if (!(frame.image[0] instanceof ByteBuffer pixels)) {
+    if (!(frame.image[0] instanceof ByteBuffer framePixels)) {
       throw new Exception("FrameBlackAndWhiter requires byte-backed image frames");
     }
 
@@ -49,10 +49,12 @@ public class FrameBlackAndWhiter extends FrameProcessor {
       throw new Exception("FrameBlackAndWhiter requires at least three image channels");
     }
 
+    byte[] pixels = copyPixelsFromFrame(framePixels);
     convertFrame(pixels);
+    copyPixelsBackToFrame(framePixels);
   }
 
-  private void convertFrame(ByteBuffer pixels) {
+  private void convertFrame(byte[] pixels) {
     int height = videoInfo.imageHeight();
     int width = videoInfo.imageWidth();
     int channels = videoInfo.imageChannels();
@@ -63,13 +65,13 @@ public class FrameBlackAndWhiter extends FrameProcessor {
       for (int x = 0; x < width; x++) {
         int base = rowStart + x * channels;
         // JavaCV supplies these decoded frames in BGR byte order.
-        int b = Byte.toUnsignedInt(pixels.get(base));
-        int g = Byte.toUnsignedInt(pixels.get(base + 1));
-        int r = Byte.toUnsignedInt(pixels.get(base + 2));
-        byte luminance = (byte) ((54 * r + 183 * g + 19 * b) / 256);
+        int blue = pixels[base] & 0xFF;
+        int green = pixels[base + 1] & 0xFF;
+        int red = pixels[base + 2] & 0xFF;
+        byte luminance = (byte) ((54 * red + 183 * green + 19 * blue) / 256);
 
         for (int channel = 0; channel < channels; channel++) {
-          pixels.put(base + channel, luminance);
+          pixels[base + channel] = luminance;
         }
       }
     }

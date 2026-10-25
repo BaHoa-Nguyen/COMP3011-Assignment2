@@ -4,7 +4,7 @@
  *
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Ba Hoa Nguyen, a1938499, in collaboration with MiMo V2.6 Flash Free
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -69,7 +69,7 @@ public class FrameBleeder extends FrameProcessor {
       return;
     }
 
-    if (!(frame.image[0] instanceof ByteBuffer pixels)) {
+    if (!(frame.image[0] instanceof ByteBuffer framePixels)) {
       throw new Exception("FrameBleeder requires byte-backed image frames");
     }
 
@@ -81,9 +81,11 @@ public class FrameBleeder extends FrameProcessor {
       throw new Exception("FrameBleeder requires at least three image channels");
     }
 
+    byte[] pixels = copyPixelsFromFrame(framePixels);
     buildBrightMask(pixels);
     blurBrightMask();
     applyBleed(pixels);
+    copyPixelsBackToFrame(framePixels);
   }
 
   private void buildSamplingLookups() {
@@ -120,7 +122,7 @@ public class FrameBleeder extends FrameProcessor {
     }
   }
 
-  private void buildBrightMask(ByteBuffer pixels) {
+  private void buildBrightMask(byte[] pixels) {
     int width = videoInfo.imageWidth();
     int height = videoInfo.imageHeight();
     int channels = videoInfo.imageChannels();
@@ -140,10 +142,10 @@ public class FrameBleeder extends FrameProcessor {
           for (int x = blockX; x < blockXEnd; x++) {
             int base = rowStart + x * channels;
             // JavaCV supplies these decoded frames in BGR byte order.
-            int b = Byte.toUnsignedInt(pixels.get(base));
-            int g = Byte.toUnsignedInt(pixels.get(base + 1));
-            int r = Byte.toUnsignedInt(pixels.get(base + 2));
-            int luminance = (54 * r + 183 * g + 19 * b) / 256;
+            int blue = pixels[base] & 0xFF;
+            int green = pixels[base + 1] & 0xFF;
+            int red = pixels[base + 2] & 0xFF;
+            int luminance = (54 * red + 183 * green + 19 * blue) / 256;
             maximumLuminance = Math.max(maximumLuminance, luminance);
           }
         }
@@ -202,7 +204,7 @@ public class FrameBleeder extends FrameProcessor {
     }
   }
 
-  private void applyBleed(ByteBuffer pixels) {
+  private void applyBleed(byte[] pixels) {
     int width = videoInfo.imageWidth();
     int height = videoInfo.imageHeight();
     int channels = videoInfo.imageChannels();
@@ -222,9 +224,9 @@ public class FrameBleeder extends FrameProcessor {
         int redBoost = (int) Math.round(bleedStrength * RED_BLEED_STRENGTH);
         int base = rowStart + x * channels;
 
-        pixels.put(base, boostedByte(pixels.get(base), blueBoost));
-        pixels.put(base + 1, boostedByte(pixels.get(base + 1), greenBoost));
-        pixels.put(base + 2, boostedByte(pixels.get(base + 2), redBoost));
+        pixels[base] = boostedByte(pixels[base], blueBoost);
+        pixels[base + 1] = boostedByte(pixels[base + 1], greenBoost);
+        pixels[base + 2] = boostedByte(pixels[base + 2], redBoost);
       }
     }
   }

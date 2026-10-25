@@ -51,7 +51,7 @@ public class FrameVignetter extends FrameProcessor {
       return;
     }
 
-    if (!(frame.image[0] instanceof ByteBuffer pixels)) {
+    if (!(frame.image[0] instanceof ByteBuffer framePixels)) {
       throw new Exception("FrameVignetter requires byte-backed image frames");
     }
 
@@ -63,7 +63,9 @@ public class FrameVignetter extends FrameProcessor {
       throw new Exception("FrameVignetter requires at least one image channel");
     }
 
+    byte[] pixels = copyPixelsFromFrame(framePixels);
     vignetteFrame(pixels);
+    copyPixelsBackToFrame(framePixels);
   }
 
   private void buildLookups() {
@@ -120,7 +122,7 @@ public class FrameVignetter extends FrameProcessor {
     return envelope;
   }
 
-  private void vignetteFrame(ByteBuffer pixels) {
+  private void vignetteFrame(byte[] pixels) {
     int height = videoInfo.imageHeight();
     int width = videoInfo.imageWidth();
     int channels = videoInfo.imageChannels();
@@ -136,9 +138,9 @@ public class FrameVignetter extends FrameProcessor {
 
         for (int channel = 0; channel < channels; channel++) {
           int index = base + channel;
-          int value = Byte.toUnsignedInt(pixels.get(index));
-          value = Byte.toUnsignedInt(xLookup[value]);
-          pixels.put(index, yLookup[value]);
+          int value = pixels[index] & 0xFF;
+          value = xLookup[value] & 0xFF;
+          pixels[index] = yLookup[value];
         }
       }
     }

@@ -4,7 +4,7 @@
  *
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. <student name and student number insert here upon modification>
+ *   2. Ba Hoa Nguyen, a1938499, in collaboration with MiMo V2.6 Flash Free
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -15,6 +15,7 @@ import comp3011.dto.InfoVideo;
 
 import java.nio.charset.StandardCharsets;
 import java.util.zip.CRC32;
+import java.nio.ByteBuffer;
 
 import org.bytedeco.javacv.Frame;
 
@@ -40,6 +41,7 @@ import org.bytedeco.javacv.Frame;
  */
 public abstract class FrameProcessor {
   protected InfoVideo videoInfo;
+  private byte[] pixelData;
 
   public FrameProcessor() {
   }
@@ -57,6 +59,23 @@ public abstract class FrameProcessor {
   // deterministic.
   protected int saltedMediaSeed(String mediaName, int instanceIndex) {
     return hashMediaName(mediaName) + instanceIndex;
+  }
+
+  // copy the pixels of the frame to byte array
+  protected byte[] copyPixelsFromFrame(ByteBuffer framePixels) {
+    int pixelByteCount = framePixels.limit(); // the boundary
+
+    if (pixelData == null || pixelData.length != pixelByteCount) {
+      pixelData = new byte[pixelByteCount]; // one video, one frame size
+    }
+
+    framePixels.get(0, pixelData, 0, pixelByteCount);
+    return pixelData;
+  }
+
+  // put back the processed pixel to the frame
+  protected void copyPixelsBackToFrame(ByteBuffer framePixels) {
+    framePixels.put(0, pixelData, 0, pixelData.length);
   }
 
   private int hashMediaName(String mediaName) {

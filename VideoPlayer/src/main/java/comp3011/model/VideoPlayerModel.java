@@ -4,7 +4,7 @@
  *
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. Ba Hoa Nguyen - a1938499, in collaboration with Muse Spark 1.3 Free
+ *   2. Ba Hoa Nguyen - a1938499, in collaboration with MiMo V2.6 Flash Free
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -30,6 +30,8 @@ import java.util.concurrent.TimeUnit;
 
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+
+import javax.sound.sampled.LineUnavailableException;
 
 import org.bytedeco.javacv.FFmpegFrameGrabber;
 import org.bytedeco.javacv.Frame;
@@ -96,6 +98,7 @@ public class VideoPlayerModel {
 
   // True when the decoder has reached the end of the video.
   private volatile boolean videoEnded = false;
+  private volatile boolean decodeDone = false;
 
   // Stores an error produced during background playback processing.
   private volatile Exception backgroundPlaybackError = null;
@@ -281,7 +284,7 @@ public class VideoPlayerModel {
         long seekUs = pendingSeekUs;
 
         // seek requested
-        if (seekUs != NO_SEEK_REQUEST) {
+        if (seekUs != NO_SEEK_REQUEST && pendingSeekUs == seekUs) {
           pendingSeekUs = NO_SEEK_REQUEST; // mark the request handled
           grabber.setTimestamp(seekUs);
         }
@@ -331,6 +334,8 @@ public class VideoPlayerModel {
       if (playbackOpen) {
         backgroundPlaybackError = e;
       }
+    } finally {
+      decodeDone = true; // any exit (END packet, shutdown, error) means dead decoder
     }
   }
 
@@ -367,6 +372,15 @@ public class VideoPlayerModel {
           offerToQueue(nextWaitingQueue, END_PACKET);
           return;
 
+        }
+
+        // kill cancelled frames at the stage head
+        // A seek or a stop happened while this frame was travelling, so it belongs to
+        // the previous round of playback and will never be shown. Drop it here, before
+        // any effect runs, instead of paying for all 58 effects on a frame already
+        // cancelled.
+        if (framePacket.version() != playbackVersion) {
+          continue;
         }
 
         if (frameProcessor != null) {
@@ -437,8 +451,21 @@ public class VideoPlayerModel {
               framePacket.timestampUs(),
               logicalTimestampUs,
               targetTimeNs,
-              readyNs);
+              readyNs,
+              framePacket.version());
 
+        }
+
+        // audio open can block ~100ms+; do it once, only after a frame
+        // is already published, so it never sits on the first-frame
+        // critical path
+        if (audioAvailable && audioPlayer == null) {
+          audioPlayer = new AudioPlayer();
+          try {
+            audioPlayer.open(grabber.getSampleRate(), grabber.getAudioChannels());
+          } catch (LineUnavailableException e) {
+            audioAvailable = false; // no sound line --> video continues silently
+          }
         }
 
       }
@@ -456,7 +483,10 @@ public class VideoPlayerModel {
   private void startPipeline() {
     pipeline = Executors.newFixedThreadPool(stageCount + 1, runnable -> {
       Thread thread = new Thread(runnable);
+
       thread.setDaemon(true);
+      // keep the FX rendering thread ahead of effect workers
+      thread.setPriority(Thread.MIN_PRIORITY);
       return thread;
     });
 
@@ -484,7 +514,7 @@ public class VideoPlayerModel {
     long logicalTimestampUs = clampSeekTimestamp(timestampUs);
     long grabTimestampUs = displayableSeekTimestamp(logicalTimestampUs);
 
-    if (!playbackOpen || videoEnded) {
+    if (!playbackOpen || videoEnded || decodeDone) {
       startPlayback(grabTimestampUs, pauseRequested, logicalTimestampUs);
       return;
     }
@@ -555,11 +585,6 @@ public class VideoPlayerModel {
         : NO_SEEK_REQUEST;
 
     audioAvailable = grabber.hasAudio();
-
-    audioPlayer = new AudioPlayer();
-    if (audioAvailable) {
-      audioPlayer.open(grabber.getSampleRate(), grabber.getAudioChannels());
-    }
 
     if (startTimestampUs > 0) {
       grabber.setTimestamp(startTimestampUs);
@@ -635,7 +660,15 @@ public class VideoPlayerModel {
     synchronized (preparedFrameLock) {
       frame = preparedFrame;
       preparedFrame = null;
+
       preparedFrameLock.notifyAll();
+
+      // a seek or shutdown can clear or re-version the frame between the
+      // due-check in pumpPlayback and taking this lock: bail instead of
+      // showing a torn stale frame or NPE-ing on the FX thread
+      if (frame == null || frame.version() != playbackVersion) {
+        return;
+      }
       currentTimestampUs = frame.logicalTimestampUs();
       relativeSeekBaseUs = NO_SEEK_REQUEST;
     }
@@ -737,6 +770,7 @@ public class VideoPlayerModel {
     playbackOpen = false;
     pendingSeekUs = NO_SEEK_REQUEST;
     videoEnded = false;
+    decodeDone = false;
 
     synchronized (preparedFrameLock) {
       playbackVersion++;
