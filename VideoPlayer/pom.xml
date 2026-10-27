@@ -4,7 +4,7 @@
 
   Authors:
     1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
-    2. <student name and student number insert here upon modification>
+    2. Ba Hoa Nguyen - a1938499, in collaboration with MiMo-V2.6-Flash Free
 
   Copyright 2026 Simon Ratcliffe
 -->
@@ -21,6 +21,7 @@
     <maven.compiler.release>25</maven.compiler.release>
     <javafx.version>26.0.2</javafx.version>
     <javacv.version>1.5.13</javacv.version>
+    <junit.version>5.11.4</junit.version>
   </properties>
 
   <dependencies>
@@ -33,6 +34,12 @@
       <groupId>org.bytedeco</groupId>
       <artifactId>javacv-platform</artifactId>
       <version>${javacv.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 
@@ -49,6 +56,11 @@
                 <option>--enable-native-access=ALL-UNNAMED</option>
             </options>
         </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.6</version>
       </plugin>
     </plugins>
   </build>

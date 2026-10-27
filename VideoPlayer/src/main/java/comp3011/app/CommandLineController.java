@@ -4,7 +4,7 @@
  *
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. Ba Hoa Nguyen - a1938499, in collaboration with Muse Spark 1.3 free
+ *   2. Ba Hoa Nguyen - a1938499, in collaboration with MiMo-V2.6-Flash Free
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -224,6 +224,9 @@ public class CommandLineController {
   }
 
   private void validateVideoFile(List<String> videoFiles) {
+    if (errorMessage != null) {
+      return; // keep the first, more specific error instead of overwriting it
+    }
     if (videoFiles.size() > 1) {
       errorMessage = "Usage: VideoPlayer [options] [video-file]";
     } else if (videoFiles.size() == 1) {

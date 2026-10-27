@@ -4,7 +4,7 @@
  *
  * Authors:
  *   1. Simon Ratcliffe, in collaboration with GPT-5.6 Terra
- *   2. Ba Hoa Nguyen - a1938499, in collaboration with MiMo V2.6 Flash Free
+ *   2. Ba Hoa Nguyen - a1938499, in collaboration with MiMo-V2.6-Flash Free
  *
  * Copyright 2026 Simon Ratcliffe
  */
@@ -151,6 +151,12 @@ public class VideoPlayerModel {
   private volatile long currentTimestampUs; // where we are in the video (e.g. 4:00)
   private volatile long videoDurationUs = NO_SEEK_REQUEST;
   private volatile int videoFrameDurationUs;
+  // Grabber metadata captured once in openPlaybackResources(), on the thread that
+  // owns startup. FFmpegFrameGrabber is not thread-safe, so stage threads must
+  // never call back into it - they read these fields instead.
+  private volatile int pixelFormat;
+  private volatile int sampleRate;
+  private volatile int audioChannels;
   private volatile double frameRate; // frame rate in double
   private volatile int intFrameRate; // frame rate in Integer
   private volatile int totalVideoFrames;
@@ -275,7 +281,7 @@ public class VideoPlayerModel {
   // The decode worker decode the video in Frames and place them into waiting
   // queue 0, where the effect worker will grab those frames and apply effect to
   // them
-  private void decodeFrame() {
+  private void runDecodeStage() {
     try {
       while (playbackOpen) {
 
@@ -344,7 +350,7 @@ public class VideoPlayerModel {
   // The number of workers are based on the number of effects coming from the CLI
   // plus the final worker to convert and publish the processed frame to the GUI
   // thread one-by-one.
-  private void processDecodedFrame(int stageIndex) {
+  private void runEffectStage(int stageIndex) {
     ArrayBlockingQueue<FramePacket> currentWaitingQueue = waitingQueues.get(stageIndex);
 
     boolean isLastStage = stageIndex == stageCount - 1;
@@ -377,7 +383,7 @@ public class VideoPlayerModel {
         // kill cancelled frames at the stage head
         // A seek or a stop happened while this frame was travelling, so it belongs to
         // the previous round of playback and will never be shown. Drop it here, before
-        // any effect runs, instead of paying for all 58 effects on a frame already
+        // any effect runs, instead of paying for every queued effect on a frame already
         // cancelled.
         if (framePacket.version() != playbackVersion) {
           continue;
@@ -396,7 +402,7 @@ public class VideoPlayerModel {
                 frameRate,
                 intFrameRate,
                 videoFrameDurationUs,
-                grabber.getPixelFormat()));
+                pixelFormat));
 
             isProcessorInitialised = true;
           }
@@ -462,7 +468,7 @@ public class VideoPlayerModel {
         if (audioAvailable && audioPlayer == null) {
           audioPlayer = new AudioPlayer();
           try {
-            audioPlayer.open(grabber.getSampleRate(), grabber.getAudioChannels());
+            audioPlayer.open(sampleRate, audioChannels);
           } catch (LineUnavailableException e) {
             audioAvailable = false; // no sound line --> video continues silently
           }
@@ -490,11 +496,11 @@ public class VideoPlayerModel {
       return thread;
     });
 
-    pipeline.execute(this::decodeFrame);
+    pipeline.execute(this::runDecodeStage);
 
     for (int stageIndex = 0; stageIndex < stageCount; stageIndex++) {
       final int lambdaIndex = stageIndex;
-      pipeline.execute(() -> processDecodedFrame(lambdaIndex));
+      pipeline.execute(() -> runEffectStage(lambdaIndex));
     }
 
   }
@@ -569,6 +575,12 @@ public class VideoPlayerModel {
     grabber.setImageMode(FrameGrabber.ImageMode.COLOR);
     grabber.setSampleMode(FrameGrabber.SampleMode.SHORT);
     grabber.start();
+
+    // read the grabber's metadata here, on the one thread that owns startup;
+    // the stage threads must never call back into FFmpegFrameGrabber
+    pixelFormat = grabber.getPixelFormat();
+    sampleRate = grabber.getSampleRate();
+    audioChannels = grabber.getAudioChannels();
 
     notifyVideoSizeChanged(grabber.getImageWidth(), grabber.getImageHeight());
 
@@ -787,12 +799,22 @@ public class VideoPlayerModel {
     playbackStartNs = 0;
     pauseStartedNs = 0;
     audioAvailable = false;
+    pixelFormat = 0;
+    sampleRate = 0;
+    audioChannels = 0;
 
     if (pipeline != null) {
-      pipeline.shutdown();
+      // shutdownNow interrupts the workers' 50ms poll/offer waits so they stop at
+      // once; plain shutdown() could pin this (FX) thread in awaitTermination for 2s
+      // every time the player stops or restarts.
+      pipeline.shutdownNow();
 
       try {
-        pipeline.awaitTermination(2, TimeUnit.SECONDS);
+        // short grace period only: long enough for an effect loop to finish its
+        // current frame, short enough that stopping stays instant on screen
+        if (!pipeline.awaitTermination(200, TimeUnit.MILLISECONDS)) {
+          System.out.println("Playback workers did not stop within 200ms");
+        }
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
       }
