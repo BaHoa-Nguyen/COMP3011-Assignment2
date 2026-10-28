@@ -38,7 +38,7 @@ Usage: VideoPlayer [options] [video-file]
 
 ## Design correctness (multi-threaded playback)
 
-One pipeline is built per playback session from the parsed effect list, and there is a decode worker at the beginning of the pipeline. The number frame processors will be created based on the number of effects entered from the CLI. When all the effects have been applied to the frame, a final publish worker will convert those frame back into the image which would be then shown to the user.
+One `FramePipelineProcessor` is built per playback session from the parsed effect list, and there is a decode worker at the beginning of the pipeline. The number frame processors will be created based on the number of effects entered from the CLI. When all the effects have been applied to the frame, a final publish worker will convert those frame back into the image which would be then shown to the user.
 
 Between each worker, including the decode one, there will be a waiting queue capped at 2 capacity. The reason I keep the queue capacity at 2 is that two is a small buffer that helps the video pipeline keep moving without using too much memory. Think of this like a warehouse, we can have a really big one but the workers are limited to the number of effects from the CLI, so no matter how big the warehouse is, the performance is still dependent on the number of frame processors.
 
@@ -80,18 +80,20 @@ decode, effects or convert.
 
 ### Shutdown
 
-`closePlaybackResources()` sets `playbackOpen = false`, bumps `playbackVersion`,
-clears every queue, then calls `pipeline.shutdownNow()`. The interrupt wakes workers
-out of their 50 ms poll/offer waits, so the calling JavaFX thread only waits a
-200 ms grace period, not the 2 seconds a plain `shutdown()` could stall the window
-for, and before the grabber, converter and audio line are closed already.
+`closePlaybackResources()` detaches the pipeline (a null pipeline now means
+"nothing is playing"), raises the playback version under the frame lock so no stale
+frame can be shown, then calls `FramePipelineProcessor.stop()`. That interrupts the
+workers out of their 50 ms poll/offer waits and clears every queue, so the calling
+JavaFX thread only waits a 200 ms grace period - not the 2 seconds a plain
+`shutdown()` could stall the window for - before the grabber, converter and audio
+line are closed.
 
 ## Changes to the supplied starter code
 
 | Starter file                                                                                               | Change                                                                                                                                                                          |
 | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CommandLineController`                                                                                    | effect parsing (bundled flags, order, repeats), generated help text, option tables moved into `CommandOption`/`FrameEffectOption` records, first-error-wins validation          |
-| `VideoPlayerModel`                                                                                         | single worker thread replaced by the decode/effect/publish pipeline; versioned `FramePacket`; `preparedFrameLock` guarding the shared frame and clock; `shutdownNow()` on close |
+| `VideoPlayerModel`                                                                                         | single worker thread replaced by the decode/effect/publish pipeline (now extracted into `FramePipelineProcessor`); versioned `FramePacket`; `preparedFrameLock` guarding the shared frame and clock; interrupt-based shutdown on close |
 | `VideoPlayerApp`, `VideoPlayerController`                                                                  | hand the `FrameProcessor` list through to the model (ownership established in `VideoPlayerModel`)                                                                               |
 | `FrameProcessor`                                                                                           | new `copyPixelsFromFrame`/`copyPixelsBackToFrame` helpers so effects walk a `byte[]` instead of per-pixel `ByteBuffer.get`                                                      |
 | `FrameBlackAndWhiter`, `FrameBleeder`, `FrameFlickerer`, `FrameMottler`, `FrameVignetter`, `FrameYellower` | pixel loops rewritten onto the `byte[]` helpers                                                                                                                                 |
@@ -99,7 +101,7 @@ for, and before the grabber, converter and audio line are closed already.
 | `InfoFrame`, `InfoVideo`                                                                                   | moved to `comp3011.dto`, content unchanged                                                                                                                                      |
 | `AudioPlayer`, `VideoPlayerView`, `VideoPlayerAppLauncher`                                                 | package move + attribution only (logic unchanged)                                                                                                                               |
 | `pom.xml`                                                                                                  | JUnit 5 + Surefire for the test suite                                                                                                                                           |
-| new files                                                                                                  | `FramePacket`, `PreparedFrame`, `PendingAudio`, `CommandOption`, `FrameEffectOption`, `src/test/java/comp3011/app/CommandLineControllerTest.java`                               |
+| new files                                                                                                  | `FramePipelineProcessor` (the decode/effect/publish pipeline, extracted from the model), `VideoMetadata`, `FramePacket`, `PreparedFrame`, `PendingAudio`, `CommandOption`, `FrameEffectOption`, `src/test/java/comp3011/app/CommandLineControllerTest.java`                               |
 
 ## Testing
 

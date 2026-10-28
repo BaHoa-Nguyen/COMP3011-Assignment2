@@ -11,24 +11,19 @@
 package comp3011.model;
 
 import comp3011.effects.FrameProcessor;
-import comp3011.dto.InfoFrame;
-import comp3011.dto.InfoVideo;
+import comp3011.dto.VideoMetadata;
 
 import java.io.File;
 
 import java.util.List;
-import java.util.ArrayList;
 import java.util.Queue;
 
-// split the decode + effect into a separate worker thread
-// from the GUI (JavaFX) thread
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+// the pipeline runs its workers on their own threads, away from the
+// GUI (JavaFX) thread
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.TimeUnit;
 
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 import javax.sound.sampled.LineUnavailableException;
@@ -46,15 +41,13 @@ import javafx.scene.image.Image;
  * The model part of the video player model-view-controller architecture.
  *
  * <p>
- * Owns the FFmpeg decoder, playback clock, seeking logic, audio scheduling,
- * and frame processing through an ordered multi-threading pipeline:
- * decode -&gt; effect[0] -&gt ... -&gt; effect[n-1] -&gt; convert then publish
- * in the final thread
- * Each worker owns one effect only, and once it has finished applying the
- * frame, it will forward the frame to the next worker thread over a bounded
- * queue. The JavaFX thread only displays due frames and drains audio, so the
- * GUI never blocks on decode/effects/convert. Order and repeats come from the
- * CLI list; see EFFECTS in {@link CommandLineController}.
+ * Owns the FFmpeg decoder, playback clock, seeking logic and audio scheduling.
+ * Frame processing itself lives in {@link FramePipelineProcessor}, which this
+ * class creates fresh for every playback session from the effect list on the
+ * command line: decode -&gt; effect[0] -&gt ... -&gt; effect[n-1] -&gt; display.
+ * The JavaFX thread only displays due frames and drains audio, so the GUI
+ * never blocks on decode/effects/convert. This class keeps the frame lock and
+ * the clock; the pipeline keeps the workers and the buckets between them.
  * </p>
  */
 public class VideoPlayerModel {
@@ -62,46 +55,98 @@ public class VideoPlayerModel {
   private static final long FIVE_SECONDS_US = 5_000_000L; // calculated in MicroSeconds
   private static final long AUDIO_LEAD_NS = 30_000_000L;
 
-  // How many frames a stage may leave waiting for the next stage.
-  // Every waiting frame is a full copy of the picture (about 4.6 MB at 1920x800),
-  // and this
-  // number is multiplied by every stage to become the memory the player keeps
-  // alive.
-  // The screen only takes one frame every 41,667 microseconds anyway, so deep
-  // queues never
-  // make playback faster - they only cost memory, garbage collection pauses, and
-  // effects
-  // paid for on frames a seek has already cancelled.
-  private static final int QUEUE_CAPACITY = 2;
-  private static final FramePacket END_PACKET = new FramePacket(null, 0, -1, 0); // mark the end of the video
-
   // Protects access to the prepared frame shared between threads.
   private final Object preparedFrameLock = new Object();
 
-  // each worker will have its own effect, and between the workers there would be
-  // a waiting queue
-  // the decoded frame will be in the waitingQueues 0
-  private final List<ArrayBlockingQueue<FramePacket>> waitingQueues;
+  // This session's assembly line (workers + the buckets between them).
+  // null means "nothing is playing" - that is how every reader tells.
+  // Written only on the JavaFX thread; read by the FX heartbeat and the sink.
+  private volatile FramePipelineProcessor pipeline;
 
-  // the number of stages the frame will undergo
-  private final int stageCount;
-  private ExecutorService pipeline;
+  // Asks the decode worker whether sound is still wanted, on every frame.
+  // Reads the volatile audioAvailable field instead of freezing a copy.
+  private final BooleanSupplier wantsSamples = () -> this.audioAvailable;
 
-  // GUI -> decode worker: where to seek next. Written BEFORE the version
-  // bump in seekTo(); the decode loop reads playbackVersion first, then
-  // this, so a packet can never carry the new version with the old position.
-  private volatile long pendingSeekUs = NO_SEEK_REQUEST;
+  // The two hand-off points of the pipeline, running on worker threads:
+  // one collects a decoded frame's sound, the other converts a finished
+  // frame to an image and publishes it under the frame lock.
+  private final FramePipelineProcessor.FrameSink frameSink = new FramePipelineProcessor.FrameSink() {
+    @Override
+    public void onFrameDecoded(Frame frame, long timestampUs) {
+      if (audioAvailable && frame.samples != null) {
+        queueAudio(timestampUs, frame);
+      }
+    }
 
-  // Version of the current playback session.
-  // Incremented when seeking or closing so old frames can be discarded.
-  private volatile long playbackVersion = 0;
+    @Override
+    public void onFrameReadyForDisplay(FramePacket packet) {
+      FramePipelineProcessor active = pipeline;
 
-  // True when the decoder has reached the end of the video.
-  private volatile boolean videoEnded = false;
-  private volatile boolean decodeDone = false;
+      // Convert off-lock: making the image can take a millisecond and must
+      // never hold up the GUI thread.
+      Image image = converter.convert(packet.frame());
+      long readyNs = System.nanoTime();
 
-  // Stores an error produced during background playback processing.
-  private volatile Exception backgroundPlaybackError = null;
+      synchronized (preparedFrameLock) {
+        // Wait until the screen has taken the previous frame (or until we are
+        // paused, or until a seek/close wakes us). One frame in flight at a
+        // time: that is what keeps memory and frame pacing steady.
+        try {
+          while (pipeline != null && (pauseRequested || preparedFrame != null)) {
+            preparedFrameLock.wait(50);
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return; // stop() interrupted us: drop this frame and stand down
+        }
+
+        if (pipeline == null) {
+          return; // the player was closed while we waited
+        }
+
+        // Round check: a seek happened while we waited, so this frame is
+        // stale. Drop it instead of flashing an old picture.
+        if (packet.version() != active.currentFrameVersion()) {
+          return;
+        }
+
+        // First frame of this playback: anchor the clock to it.
+        if (firstTimestampUs == NO_SEEK_REQUEST) {
+          firstTimestampUs = packet.timestampUs();
+          playbackStartNs = System.nanoTime();
+          if (pauseRequested) {
+            pauseStartedNs = playbackStartNs;
+          }
+        }
+
+        // Work out where this frame should appear on the timeline.
+        long relativeTimestampUs = Math.max(0, packet.timestampUs() - firstTimestampUs);
+        long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
+        long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
+
+        // Hand the frame over: the FX heartbeat displays it when its time comes.
+        preparedFrame = new PreparedFrame(
+            image,
+            packet.frameNumber(),
+            packet.timestampUs(),
+            logicalTimestampUs,
+            targetTimeNs,
+            readyNs,
+            packet.version());
+      }
+
+      // Opening the sound device can block for ~100ms, so do it once, only
+      // after a frame is already on screen - never on the first-frame path.
+      if (audioAvailable && audioPlayer == null) {
+        audioPlayer = new AudioPlayer();
+        try {
+          audioPlayer.open(sampleRate, audioChannels);
+        } catch (LineUnavailableException e) {
+          audioAvailable = false; // no sound line --> video continues silently
+        }
+      }
+    }
+  };
 
   private final List<FrameProcessor> frameProcessors; // store frames
   private final Queue<PendingAudio> pendingAudio = new ConcurrentLinkedQueue<>(); // ConcurrentLinkedQueue because two
@@ -143,7 +188,6 @@ public class VideoPlayerModel {
                                           // screen.
   private volatile AudioPlayer audioPlayer; // This is ours. It has some real time buffering smarts.
   private volatile PreparedFrame preparedFrame; // Ours, but is just an Image with some meta-data added.
-  private volatile boolean playbackOpen; // True when playback is happening.
   private volatile boolean pauseRequested; // request pause
   private volatile boolean audioOutputEnabled;
   private volatile boolean audioAvailable;
@@ -181,15 +225,7 @@ public class VideoPlayerModel {
     this.statusChangedHandler = statusChangedHandler;
     this.playbackStateChangedHandler = playbackStateChangedHandler;
     this.audioOutputStateChangedHandler = audioOutputStateChangedHandler;
-    this.frameProcessors = frameProcessors;
-    this.stageCount = frameProcessors.size() + 1; // each worker has its own frame + the final worker (the +1 part)
-                                                  // doing the convert
-                                                  // and publish.
-    this.waitingQueues = new ArrayList<>(stageCount); // create the container
-    // build up the assembly line
-    for (int stageIndex = 0; stageIndex < stageCount; stageIndex++) {
-      waitingQueues.add(new ArrayBlockingQueue<>(QUEUE_CAPACITY));
-    }
+    this.frameProcessors = frameProcessors; // the pipeline is built from this list, in this order
   }
 
   // play the video file
@@ -221,7 +257,7 @@ public class VideoPlayerModel {
 
   // request pause (flip pauseRequested)
   public void togglePause() {
-    if (!playbackOpen) {
+    if (pipeline == null) { // nothing is playing: start it up again from where it stopped
       if (videoFile != null) {
         startPlayback(displayableSeekTimestamp(currentTimestampUs), false, currentTimestampUs);
       }
@@ -267,242 +303,22 @@ public class VideoPlayerModel {
     closePlaybackResources();
   }
 
-  private boolean offerToQueue(ArrayBlockingQueue<FramePacket> waitingQueue, FramePacket framePacket)
-      throws InterruptedException {
-    while (playbackOpen) {
-      if (waitingQueue.offer(framePacket, 50, TimeUnit.MILLISECONDS)) {
-        return true;
-      }
-    }
-    return false;
-
-  }
-
-  // The decode worker decode the video in Frames and place them into waiting
-  // queue 0, where the effect worker will grab those frames and apply effect to
-  // them
-  private void runDecodeStage() {
-    try {
-      while (playbackOpen) {
-
-        // check if the user wants to seek or not
-        long packetVersion = playbackVersion;
-        long seekUs = pendingSeekUs;
-
-        // seek requested
-        if (seekUs != NO_SEEK_REQUEST && pendingSeekUs == seekUs) {
-          pendingSeekUs = NO_SEEK_REQUEST; // mark the request handled
-          grabber.setTimestamp(seekUs);
-        }
-
-        Frame frame = grabFrame();
-
-        // video not playing
-        if (!playbackOpen) {
-          return;
-        }
-
-        // reach the end of the video
-        if (frame == null) {
-          offerToQueue(waitingQueues.get(0), END_PACKET);
-          return;
-        }
-
-        long timestampUs = grabber.getTimestamp();
-
-        // if there is audio and the frame contains the audio data
-        if (audioAvailable && frame.samples != null) {
-          queueAudio(timestampUs, frame);
-        }
-
-        // skip frames that does not contain images
-        if (frame.image == null) {
-          continue;
-        }
-
-        // grab() override the existing frame data, which could corrupt the pipeline
-        // we need to use .clone() here to avoid that
-        // Reference:
-        // https://boofcv.org/javadoc/org/bytedeco/copiedstuff/FFmpegFrameGrabber.html#grab()
-        FramePacket clonedPacket = new FramePacket(
-            frame.clone(),
-            timestampUs,
-            grabber.getFrameNumber(),
-            packetVersion);
-
-        if (!offerToQueue(waitingQueues.get(0), clonedPacket)) {
-          return;
-        }
-      }
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-    } catch (Exception e) {
-      if (playbackOpen) {
-        backgroundPlaybackError = e;
-      }
-    } finally {
-      decodeDone = true; // any exit (END packet, shutdown, error) means dead decoder
-    }
-  }
-
-  // This method will concurrently take the frame from the waiting queue and apply
-  // the effect to them.
-  // The number of workers are based on the number of effects coming from the CLI
-  // plus the final worker to convert and publish the processed frame to the GUI
-  // thread one-by-one.
-  private void runEffectStage(int stageIndex) {
-    ArrayBlockingQueue<FramePacket> currentWaitingQueue = waitingQueues.get(stageIndex);
-
-    boolean isLastStage = stageIndex == stageCount - 1;
-
-    ArrayBlockingQueue<FramePacket> nextWaitingQueue = isLastStage ? null : waitingQueues.get(stageIndex + 1);
-
-    FrameProcessor frameProcessor = stageIndex < frameProcessors.size() ? frameProcessors.get(stageIndex) : null;
-
-    boolean isProcessorInitialised = false;
-
-    try {
-      while (playbackOpen) {
-        FramePacket framePacket = currentWaitingQueue.poll(50, TimeUnit.MILLISECONDS);
-
-        if (framePacket == null) {
-          continue;
-        }
-
-        if (framePacket == END_PACKET) {
-          if (isLastStage) {
-            videoEnded = true;
-            return;
-          }
-
-          offerToQueue(nextWaitingQueue, END_PACKET);
-          return;
-
-        }
-
-        // kill cancelled frames at the stage head
-        // A seek or a stop happened while this frame was travelling, so it belongs to
-        // the previous round of playback and will never be shown. Drop it here, before
-        // any effect runs, instead of paying for every queued effect on a frame already
-        // cancelled.
-        if (framePacket.version() != playbackVersion) {
-          continue;
-        }
-
-        if (frameProcessor != null) {
-          if (!isProcessorInitialised) {
-            frameProcessor.initialise(new InfoVideo(
-                mediaName(videoFile),
-                totalVideoFrames,
-                framePacket.frame().imageWidth,
-                framePacket.frame().imageHeight,
-                framePacket.frame().imageDepth,
-                framePacket.frame().imageChannels,
-                framePacket.frame().imageStride,
-                frameRate,
-                intFrameRate,
-                videoFrameDurationUs,
-                pixelFormat));
-
-            isProcessorInitialised = true;
-          }
-
-          frameProcessor.process(framePacket.frame(),
-              new InfoFrame(framePacket.frameNumber(), framePacket.timestampUs()));
-        }
-
-        if (!isLastStage) {
-          if (!offerToQueue(nextWaitingQueue, framePacket)) {
-            return;
-          }
-          continue;
-        }
-
-        // convert and publish the processed frame one by one
-        Image image = converter.convert(framePacket.frame());
-        long readyNs = System.nanoTime();
-
-        synchronized (preparedFrameLock) {
-          // if the the playback is open but
-          // (a) the video is pause or (b) there's a frame in the queue
-          // then we wait for 50ms
-          while (playbackOpen && (pauseRequested || preparedFrame != null)) {
-            preparedFrameLock.wait(50);
-          }
-
-          if (!playbackOpen) {
-            return;
-          }
-
-          if (framePacket.version() != playbackVersion) {
-            continue;
-          }
-
-          // first frame of current playback
-          if (firstTimestampUs == NO_SEEK_REQUEST) {
-            firstTimestampUs = framePacket.timestampUs();
-            playbackStartNs = System.nanoTime();
-            if (pauseRequested) {
-              pauseStartedNs = playbackStartNs;
-            }
-          }
-
-          long relativeTimestampUs = Math.max(0, framePacket.timestampUs() - firstTimestampUs);
-          long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
-          long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
-
-          preparedFrame = new PreparedFrame(
-              image,
-              framePacket.frameNumber(),
-              framePacket.timestampUs(),
-              logicalTimestampUs,
-              targetTimeNs,
-              readyNs,
-              framePacket.version());
-
-        }
-
-        // audio open can block ~100ms+; do it once, only after a frame
-        // is already published, so it never sits on the first-frame
-        // critical path
-        if (audioAvailable && audioPlayer == null) {
-          audioPlayer = new AudioPlayer();
-          try {
-            audioPlayer.open(sampleRate, audioChannels);
-          } catch (LineUnavailableException e) {
-            audioAvailable = false; // no sound line --> video continues silently
-          }
-        }
-
-      }
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-    } catch (Exception e) {
-      if (playbackOpen) {
-        backgroundPlaybackError = e;
-      }
-    }
-
-  }
-
-  // start our pipeline
+  // Build this session's assembly line from the command-line effect list
+  // and set the workers going. Called once per playback session.
   private void startPipeline() {
-    pipeline = Executors.newFixedThreadPool(stageCount + 1, runnable -> {
-      Thread thread = new Thread(runnable);
-
-      thread.setDaemon(true);
-      // keep the FX rendering thread ahead of effect workers
-      thread.setPriority(Thread.MIN_PRIORITY);
-      return thread;
-    });
-
-    pipeline.execute(this::runDecodeStage);
-
-    for (int stageIndex = 0; stageIndex < stageCount; stageIndex++) {
-      final int lambdaIndex = stageIndex;
-      pipeline.execute(() -> runEffectStage(lambdaIndex));
-    }
-
+    pipeline = new FramePipelineProcessor(
+        frameProcessors,
+        grabber,
+        wantsSamples,
+        new VideoMetadata(
+            mediaName(videoFile),
+            totalVideoFrames,
+            frameRate,
+            intFrameRate,
+            videoFrameDurationUs,
+            pixelFormat),
+        frameSink);
+    pipeline.start();
   }
 
   private void seekRelative(long offsetUs) {
@@ -520,25 +336,23 @@ public class VideoPlayerModel {
     long logicalTimestampUs = clampSeekTimestamp(timestampUs);
     long grabTimestampUs = displayableSeekTimestamp(logicalTimestampUs);
 
-    if (!playbackOpen || videoEnded || decodeDone) {
+    if (pipeline == null || pipeline.hasVideoEnded() || pipeline.hasDecodeFinished()) {
+      // Nothing running (or it just finished): start a fresh session at the new spot.
       startPlayback(grabTimestampUs, pauseRequested, logicalTimestampUs);
       return;
     }
 
-    pendingSeekUs = grabTimestampUs;
+    // Tell the decode worker where to jump - BEFORE the round number is
+    // raised, so no frame can carry the new round with the old position.
+    pipeline.requestSeek(grabTimestampUs);
 
-    // discard old frame
+    // discard old frames: raise the round number and empty the buckets
+    // while holding the frame lock, so nothing stale can still be shown
     synchronized (preparedFrameLock) {
-      playbackVersion++;
+      pipeline.discardCancelledFrames();
       preparedFrame = null;
       resetPlaybackClock(logicalTimestampUs);
       preparedFrameLock.notifyAll();
-    }
-
-    // when the user seek to another timestamp, the current frames in the queue are
-    // old so we discard them in the queue
-    for (ArrayBlockingQueue<FramePacket> waitingQueue : waitingQueues) {
-      waitingQueue.clear();
     }
 
     flushAudioOutput();
@@ -560,9 +374,8 @@ public class VideoPlayerModel {
     try {
       openPlaybackResources(startTimestampUs);
       resetPlaybackClock(currentTimestampUs);
-      playbackOpen = true;
       playbackTimer.start();
-      startPipeline();
+      startPipeline(); // a non-null pipeline from here on means "playback is open"
       notifyPlaybackStateChanged();
     } catch (Exception e) {
       handlePlaybackError(e);
@@ -634,19 +447,20 @@ public class VideoPlayerModel {
   // Workers do decode/effects/convert off-thread and publish a single
   // preparedFrame under preparedFrameLock. We consume it here
   private void pumpPlayback(long now) {
-    if (!playbackOpen) {
+    FramePipelineProcessor active = pipeline;
+    if (active == null) {
+      return; // nothing is playing
+    }
+
+    // display the error if any worker had one since we last looked
+    Exception error = active.takeStageError();
+    if (error != null) {
+      handlePlaybackError(error);
       return;
     }
 
-    // display the error if caught any
-    if (backgroundPlaybackError != null) {
-      Exception e = backgroundPlaybackError;
-      backgroundPlaybackError = null;
-      handlePlaybackError(e);
-      return;
-    }
-
-    if (videoEnded && preparedFrame == null) {
+    // the end marker reached the screen and no frame is waiting: wrap up
+    if (active.hasVideoEnded() && preparedFrame == null) {
       finishPlayback();
       return;
     }
@@ -678,7 +492,7 @@ public class VideoPlayerModel {
       // a seek or shutdown can clear or re-version the frame between the
       // due-check in pumpPlayback and taking this lock: bail instead of
       // showing a torn stale frame or NPE-ing on the FX thread
-      if (frame == null || frame.version() != playbackVersion) {
+      if (frame == null || pipeline == null || frame.version() != pipeline.currentFrameVersion()) {
         return;
       }
       currentTimestampUs = frame.logicalTimestampUs();
@@ -779,19 +593,24 @@ public class VideoPlayerModel {
 
   private void closePlaybackResources() {
     playbackTimer.stop();
-    playbackOpen = false;
-    pendingSeekUs = NO_SEEK_REQUEST;
-    videoEnded = false;
-    decodeDone = false;
 
+    // Detach first: from here on every reader sees "nothing is playing".
+    FramePipelineProcessor closing = pipeline;
+    pipeline = null;
+
+    // Throw away in-flight frames under the frame lock, so nothing stale
+    // can still reach the screen, and wake any worker waiting on the lock.
     synchronized (preparedFrameLock) {
-      playbackVersion++;
+      if (closing != null) {
+        closing.discardCancelledFrames();
+      }
       preparedFrame = null;
       preparedFrameLock.notifyAll();
     }
 
-    for (ArrayBlockingQueue<FramePacket> waitingQueue : waitingQueues) {
-      waitingQueue.clear();
+    // Now stop the workers: interrupt, drain the buckets, 200 ms grace.
+    if (closing != null) {
+      closing.stop();
     }
 
     pendingAudio.clear();
@@ -802,25 +621,6 @@ public class VideoPlayerModel {
     pixelFormat = 0;
     sampleRate = 0;
     audioChannels = 0;
-
-    if (pipeline != null) {
-      // shutdownNow interrupts the workers' 50ms poll/offer waits so they stop at
-      // once; plain shutdown() could pin this (FX) thread in awaitTermination for 2s
-      // every time the player stops or restarts.
-      pipeline.shutdownNow();
-
-      try {
-        // short grace period only: long enough for an effect loop to finish its
-        // current frame, short enough that stopping stays instant on screen
-        if (!pipeline.awaitTermination(200, TimeUnit.MILLISECONDS)) {
-          System.out.println("Playback workers did not stop within 200ms");
-        }
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-      }
-
-      pipeline = null;
-    }
 
     closeGrabberNow();
     closeConverterNow();
@@ -887,13 +687,6 @@ public class VideoPlayerModel {
     return Math.max(0, durationUs - frameDurationUs);
   }
 
-  private Frame grabFrame() throws Exception {
-    if (audioAvailable) {
-      return grabber.grab();
-    }
-    return grabber.grabImage();
-  }
-
   private void flushAudioOutput() {
     if (audioPlayer != null) {
       audioPlayer.flush();
@@ -913,7 +706,7 @@ public class VideoPlayerModel {
   }
 
   private void notifyPlaybackStateChanged() {
-    playbackStateChangedHandler.accept(playbackOpen, pauseRequested);
+    playbackStateChangedHandler.accept(pipeline != null, pauseRequested);
   }
 
   private void notifyAudioOutputStateChanged() {
