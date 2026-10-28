@@ -26,22 +26,27 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Performance evidence: the multi-threaded pipeline versus the original
  * single-threaded player, measured on the same clip and the same effects.
  *
- * <p>Plain-language version of what happens here: the test first films a tiny
+ * <p>
+ * The test first films a tiny
  * synthetic video of its own (a bright square sweeping over a shifting
  * gradient), then watches that video twice. First the "serial" run plays it
- * the old way - one thread reads a frame and applies every effect by itself,
- * exactly like the starter code did. Then the "pipelined" run plays it
+ * the old way where one thread reads a frame and applies every effect by
+ * itself,
+ * exactly like the starter code did. Then the pipelined version plays it
  * through the real {@link FramePipelineProcessor}, whose final hand-off only
- * counts frames instead of drawing them, so no screen or GUI is needed.</p>
+ * counts frames instead of drawing them, so no screen or GUI is needed.
+ * </p>
  *
- * <p>How to read the printed table: at k=11 effects (the full 11-effect
+ * <p>
+ * How to read the printed table: at k=11 effects (the full 11-effect
  * command line) the pipelined column must be at least as fast as the serial
  * one - that is the one assertion. At k=0 there are no effects at all, and
  * the pipeline is expected to LOSE there: its fixed per-frame costs (the
  * defensive copy of each frame plus the hand-offs between worker threads)
  * are all that is left to see. The rows k=5 and k=11 show where the overlap
  * pays: once applying effects costs more than that overhead, the pipeline
- * pulls ahead. The test runs by itself with {@code mvn verify}.</p>
+ * pulls ahead. The test runs by itself with {@code mvn verify}.
+ * </p>
  */
 class FramePipelineProcessorLoadTest {
 
@@ -57,7 +62,7 @@ class FramePipelineProcessorLoadTest {
   // The effect counts to measure: none (decode only), about half, and all 11
   // the assignment's command line allows. Each run uses k fresh copies of the
   // same optimised effect, mirroring a command line such as "-y -y -y".
-  private static final int[] EFFECT_COUNTS = {0, 5, 11};
+  private static final int[] EFFECT_COUNTS = { 0, 5, 11 };
   private static final int FULL_LOAD = EFFECT_COUNTS[EFFECT_COUNTS.length - 1];
 
   // Hard deadline: a wedged pipeline must fail the build, not hang it. Only
@@ -122,11 +127,9 @@ class FramePipelineProcessorLoadTest {
             + nanosToMillis(serialNanosAtFullLoad) + " ms) at " + FULL_LOAD + " effects");
   }
 
-  // ------------------------------------------------------------------
-  // The ORIGINAL single-threaded player, copied faithfully. One thread reads
+  // The original single-threaded player, copied faithfully. One thread reads
   // a frame, applies every effect in a for-loop, counts the frame, repeats.
   // This is the "before" picture the performance criterion asks to compare.
-  // ------------------------------------------------------------------
   private ThroughputMeasurement runSerialBaseline(File clip, List<FrameProcessor> effects)
       throws Exception {
     ThroughputMeasurement measurement = new ThroughputMeasurement();
@@ -162,12 +165,11 @@ class FramePipelineProcessorLoadTest {
     return measurement;
   }
 
-  // ------------------------------------------------------------------
-  // The REAL FramePipelineProcessor, driven headlessly. The sink only counts
-  // finished frames - no screen, no audio, no JavaFX. Elapsed time runs from
+  // The real FramePipelineProcessor, driven headlessly. The sink only counts
+  // finished frames, meaning that no screen, no audio, no JavaFX. Elapsed time
+  // runs from
   // start() until the last frame reaches the sink, so it covers the whole
   // pipeline: decode, every effect, and the final hand-off.
-  // ------------------------------------------------------------------
   private ThroughputMeasurement runPipelinedPlayer(File clip, List<FrameProcessor> effects)
       throws Exception {
     ThroughputMeasurement measurement = new ThroughputMeasurement();
@@ -227,10 +229,7 @@ class FramePipelineProcessorLoadTest {
     return measurement;
   }
 
-  // ------------------------------------------------------------------
   // Helpers
-  // ------------------------------------------------------------------
-
   // k fresh copies of the same byte[]-optimised effect. Repeating one class
   // mirrors a command line like "-y -y -y": every occurrence is its own
   // effect object, exactly like the command-line controller builds them.

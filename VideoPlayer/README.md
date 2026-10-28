@@ -90,18 +90,18 @@ line are closed.
 
 ## Changes to the supplied starter code
 
-| Starter file                                                                                               | Change                                                                                                                                                                          |
-| ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CommandLineController`                                                                                    | effect parsing (bundled flags, order, repeats), generated help text, option tables moved into `CommandOption`/`FrameEffectOption` records, first-error-wins validation          |
-| `VideoPlayerModel`                                                                                         | single worker thread replaced by the decode/effect/publish pipeline (now extracted into `FramePipelineProcessor`); versioned `FramePacket`; `preparedFrameLock` guarding the shared frame and clock; interrupt-based shutdown on close |
-| `VideoPlayerApp`, `VideoPlayerController`                                                                  | hand the `FrameProcessor` list through to the model (ownership established in `VideoPlayerModel`)                                                                               |
-| `FrameProcessor`                                                                                           | new `copyPixelsFromFrame`/`copyPixelsBackToFrame` helpers so effects walk a `byte[]` instead of per-pixel `ByteBuffer.get`                                                      |
-| `FrameBlackAndWhiter`, `FrameBleeder`, `FrameFlickerer`, `FrameMottler`, `FrameVignetter`, `FrameYellower` | pixel loops rewritten onto the `byte[]` helpers                                                                                                                                 |
-| `FrameDuster`, `FrameJitterer`, `FrameNumberer`, `FrameScratcher`, `FramePepperer`                         | package move + attribution only (logic unchanged)                                                                                                                               |
-| `InfoFrame`, `InfoVideo`                                                                                   | moved to `comp3011.dto`, content unchanged                                                                                                                                      |
-| `AudioPlayer`, `VideoPlayerView`, `VideoPlayerAppLauncher`                                                 | package move + attribution only (logic unchanged)                                                                                                                               |
-| `pom.xml`                                                                                                  | JUnit 5 + Surefire for the test suite                                                                                                                                           |
-| new files                                                                                                  | `FramePipelineProcessor` (the decode/effect/publish pipeline, extracted from the model), `VideoMetadata`, `FramePacket`, `PreparedFrame`, `PendingAudio`, `CommandOption`, `FrameEffectOption`, `src/test/java/comp3011/app/CommandLineControllerTest.java`, `src/test/java/comp3011/model/FramePipelineProcessorLoadTest.java`                               |
+| Starter file                                                                                               | Change                                                                                                                                                                                                                                                                                                                          |
+| ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CommandLineController`                                                                                    | effect parsing (bundled flags, order, repeats), generated help text, option tables moved into `CommandOption`/`FrameEffectOption` records, first-error-wins validation                                                                                                                                                          |
+| `VideoPlayerModel`                                                                                         | single worker thread replaced by the decode/effect/publish pipeline (now extracted into `FramePipelineProcessor`); versioned `FramePacket`; `preparedFrameLock` guarding the shared frame and clock; interrupt-based shutdown on close                                                                                          |
+| `VideoPlayerApp`, `VideoPlayerController`                                                                  | hand the `FrameProcessor` list through to the model (ownership established in `VideoPlayerModel`)                                                                                                                                                                                                                               |
+| `FrameProcessor`                                                                                           | new `copyPixelsFromFrame`/`copyPixelsBackToFrame` helpers so effects walk a `byte[]` instead of per-pixel `ByteBuffer.get`                                                                                                                                                                                                      |
+| `FrameBlackAndWhiter`, `FrameBleeder`, `FrameFlickerer`, `FrameMottler`, `FrameVignetter`, `FrameYellower` | pixel loops rewritten onto the `byte[]` helpers                                                                                                                                                                                                                                                                                 |
+| `FrameDuster`, `FrameJitterer`, `FrameNumberer`, `FrameScratcher`, `FramePepperer`                         | package move + attribution only (logic unchanged)                                                                                                                                                                                                                                                                               |
+| `InfoFrame`, `InfoVideo`                                                                                   | moved to `comp3011.dto`, content unchanged                                                                                                                                                                                                                                                                                      |
+| `AudioPlayer`, `VideoPlayerView`, `VideoPlayerAppLauncher`                                                 | package move + attribution only (logic unchanged)                                                                                                                                                                                                                                                                               |
+| `pom.xml`                                                                                                  | JUnit 5 + Surefire for the test suite                                                                                                                                                                                                                                                                                           |
+| new files                                                                                                  | `FramePipelineProcessor` (the decode/effect/publish pipeline, extracted from the model), `VideoMetadata`, `FramePacket`, `PreparedFrame`, `PendingAudio`, `CommandOption`, `FrameEffectOption`, `src/test/java/comp3011/app/CommandLineControllerTest.java`, `src/test/java/comp3011/model/FramePipelineProcessorLoadTest.java` |
 
 ## Testing
 
@@ -128,20 +128,20 @@ Measured on this machine with `mvn verify` (frames per second, higher is
 better; `FrameYellower` repeated k times, fresh instances for every run):
 
 | effects (k) | serial fps | pipelined fps | speedup |
-|------------:|-----------:|--------------:|--------:|
-| 0 | 5608.5 | 2472.5 | 0.44x |
-| 5 | 269.0 | 536.6 | 1.99x |
-| 11 | 123.5 | 284.2 | 2.30x |
+| ----------: | ---------: | ------------: | ------: |
+|           0 |     5608.5 |        2222.7 |   0.46x |
+|           5 |      266.6 |         562.1 |   2.11x |
+|          11 |      119.5 |         299.4 |   2.52x |
 
 How to read it:
 
 - **k=11 is the headline and the one hard assertion**: with the full 11-effect
-  command line the pipeline must be at least as fast as the serial player -
+  command line the pipeline must be at least as fast as the serial player,
   measured 2.3x, and the assertion only ever demands "at least as fast", never
   a speedup factor, so a busy grader machine cannot fail the build over
   timing noise.
-- **k=0 is where the pipeline honestly loses**, and should: with no effects
-  to overlap, all you see is the pipeline's fixed per-frame costs - the
+- **k=0 is where the pipeline honestly loses**, and with no effects
+  to overlap, all you see is the pipeline's fixed per-frame costs, which is the
   defensive copy of each frame (about 0.9 MB) plus the hand-offs between
   worker threads, roughly 0.2 ms per frame.
 - **k=5 shows the crossover**: once applying effects costs more than that
