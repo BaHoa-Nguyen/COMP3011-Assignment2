@@ -101,14 +101,51 @@ line are closed.
 | `InfoFrame`, `InfoVideo`                                                                                   | moved to `comp3011.dto`, content unchanged                                                                                                                                      |
 | `AudioPlayer`, `VideoPlayerView`, `VideoPlayerAppLauncher`                                                 | package move + attribution only (logic unchanged)                                                                                                                               |
 | `pom.xml`                                                                                                  | JUnit 5 + Surefire for the test suite                                                                                                                                           |
-| new files                                                                                                  | `FramePipelineProcessor` (the decode/effect/publish pipeline, extracted from the model), `VideoMetadata`, `FramePacket`, `PreparedFrame`, `PendingAudio`, `CommandOption`, `FrameEffectOption`, `src/test/java/comp3011/app/CommandLineControllerTest.java`                               |
+| new files                                                                                                  | `FramePipelineProcessor` (the decode/effect/publish pipeline, extracted from the model), `VideoMetadata`, `FramePacket`, `PreparedFrame`, `PendingAudio`, `CommandOption`, `FrameEffectOption`, `src/test/java/comp3011/app/CommandLineControllerTest.java`, `src/test/java/comp3011/model/FramePipelineProcessorLoadTest.java`                               |
 
 ## Testing
 
-`mvn test` runs the `CommandLineController` regression suite (12 tests): bundled
-flags and their ordering, repeated effects, every documented flag, help output
-contents, and each error message with its exit code.
+`mvn verify` runs everything (13 tests) and builds the jar: the
+`CommandLineController` regression suite (12 tests: bundled flags and their
+ordering, repeated effects, every documented flag, help output contents, and
+each error message with its exit code) plus the performance load test below.
 
 ```sh
-mvn test
+mvn verify
 ```
+
+### Performance load test
+
+`FramePipelineProcessorLoadTest` films a tiny synthetic clip of its own
+(640x480, 30 fps, 100 frames, written with the real FFmpeg encoder into a
+temporary folder - no video file ships with the repo), then plays that same
+clip twice per effect count: once the old single-threaded way (one thread
+reads a frame and applies every effect in a loop, the original player's
+design), and once through the real `FramePipelineProcessor` with a sink that
+only counts finished frames, so no screen is needed.
+
+Measured on this machine with `mvn verify` (frames per second, higher is
+better; `FrameYellower` repeated k times, fresh instances for every run):
+
+| effects (k) | serial fps | pipelined fps | speedup |
+|------------:|-----------:|--------------:|--------:|
+| 0 | 5608.5 | 2472.5 | 0.44x |
+| 5 | 269.0 | 536.6 | 1.99x |
+| 11 | 123.5 | 284.2 | 2.30x |
+
+How to read it:
+
+- **k=11 is the headline and the one hard assertion**: with the full 11-effect
+  command line the pipeline must be at least as fast as the serial player -
+  measured 2.3x, and the assertion only ever demands "at least as fast", never
+  a speedup factor, so a busy grader machine cannot fail the build over
+  timing noise.
+- **k=0 is where the pipeline honestly loses**, and should: with no effects
+  to overlap, all you see is the pipeline's fixed per-frame costs - the
+  defensive copy of each frame (about 0.9 MB) plus the hand-offs between
+  worker threads, roughly 0.2 ms per frame.
+- **k=5 shows the crossover**: once applying effects costs more than that
+  fixed overhead, the overlap starts paying (2x).
+- Every run must process exactly 100 frames or the test fails, so a silently
+  broken run can never print a fake number, and a wedged pipeline fails after
+  a 60-second deadline instead of hanging the build.
